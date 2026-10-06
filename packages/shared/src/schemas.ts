@@ -20,7 +20,7 @@ export const structuredIntentSchema = z.object({
 
 export const intentCreateSchema = z.object({
   rawInput: z.string().min(1),
-  structured: structuredIntentSchema,
+  structured: structuredIntentSchema.optional(),
 });
 
 // ── Product ─────────────────────────────────────────────────────────────────

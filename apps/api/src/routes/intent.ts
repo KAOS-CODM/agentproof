@@ -4,12 +4,15 @@ import { intentCreateSchema } from '@agentproof/shared';
 import { getDb } from '../models/db.js';
 import { EvidenceService } from '../services/evidence/EvidenceService.js';
 import { SQLiteEvidenceRepository } from '../services/evidence/SQLiteEvidenceRepository.js';
+import { AIService } from '../services/ai/AIService.js';
 import { generateId } from '../utils/id.js';
 import { logger } from '../utils/logger.js';
 
 export const intentRouter = Router();
 
-intentRouter.post('/', (req, res) => {
+const aiService = new AIService();
+
+intentRouter.post('/', async (req, res) => {
   const parsed = intentCreateSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid request', details: parsed.error.flatten() });
@@ -19,9 +22,40 @@ intentRouter.post('/', (req, res) => {
   const db = getDb();
   const evidenceService = new EvidenceService(new SQLiteEvidenceRepository(db));
 
-  const { rawInput, structured } = parsed.data;
+  const { rawInput } = parsed.data;
   const id = generateId();
   const now = new Date().toISOString();
+
+  let structured = parsed.data.structured;
+
+  if (!structured) {
+    try {
+      const parsedIntent = await aiService.parseIntent(rawInput);
+      structured = parsedIntent.structured;
+
+      evidenceService.record({
+        eventType: 'INTENT_PARSED',
+        actor: 'llm',
+        source: 'openrouter',
+        intentId: id,
+        data: { rawInput, structured, model: parsedIntent.model },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'AI intent parsing failed';
+      logger.error('AI intent parsing failed', { error: message });
+
+      evidenceService.record({
+        eventType: 'INTENT_PARSED',
+        actor: 'llm',
+        source: 'openrouter',
+        intentId: id,
+        data: { rawInput, error: message },
+      });
+
+      res.status(502).json({ error: 'AI intent parsing failed', details: message });
+      return;
+    }
+  }
 
   db.run(
     `INSERT INTO intents (id, raw_input, structured_json, status, created_at, parsed_at, validated_at)
