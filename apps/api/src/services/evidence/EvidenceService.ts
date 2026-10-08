@@ -28,7 +28,9 @@ export type EvidenceSource =
   | 'paypal_api'
   | 'demo_fulfillment'
   | 'human_approval'
-  | 'agent';
+  | 'agent'
+  | 'demo_catalog'
+  | 'channel3';
 
 export interface CreateEvidenceParams {
   eventType: EvidenceEventType;

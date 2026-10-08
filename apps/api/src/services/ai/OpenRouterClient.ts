@@ -52,6 +52,8 @@ export const STRUCTURED_INTENT_JSON_SCHEMA = {
 export interface ChatCompletionRequest {
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
   responseFormatJson?: boolean;
+  /** Override the default structured-intent JSON schema for this call. */
+  responseSchema?: { name: string; schema: Record<string, unknown> };
 }
 
 export interface ChatCompletionResult {
@@ -95,9 +97,9 @@ export class OpenRouterClient {
                 response_format: {
                   type: 'json_schema',
                   json_schema: {
-                    name: 'structured_intent',
+                    name: request.responseSchema?.name ?? 'structured_intent',
                     strict: true,
-                    schema: STRUCTURED_INTENT_JSON_SCHEMA,
+                    schema: request.responseSchema?.schema ?? STRUCTURED_INTENT_JSON_SCHEMA,
                   },
                 },
               }

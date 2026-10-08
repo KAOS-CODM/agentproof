@@ -23,6 +23,17 @@ export const intentCreateSchema = z.object({
   structured: structuredIntentSchema.optional(),
 });
 
+// ── Product Discovery ───────────────────────────────────────────────────────
+
+export const productDiscoverRequestSchema = z
+  .object({
+    intentId: z.string().min(1).optional(),
+    structuredIntent: structuredIntentSchema.optional(),
+  })
+  .refine((v) => v.intentId !== undefined || v.structuredIntent !== undefined, {
+    message: 'Provide either intentId or structuredIntent',
+  });
+
 // ── Product ─────────────────────────────────────────────────────────────────
 
 export const productSchema = z.object({
