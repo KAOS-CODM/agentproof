@@ -6,6 +6,7 @@ import { intentRouter } from './routes/intent.js';
 import { policyRouter } from './routes/policy.js';
 import { evidenceRouter } from './routes/evidence.js';
 import { productsRouter } from './routes/products.js';
+import { paymentsRouter } from './routes/payments.js';
 import { logger } from './utils/logger.js';
 
 async function main() {
@@ -30,6 +31,7 @@ async function main() {
   app.use('/api/v1/policy', policyRouter);
   app.use('/api/v1/evidence', evidenceRouter);
   app.use('/api/v1/products', productsRouter);
+  app.use('/api/v1/payments', paymentsRouter);
 
   // 404 handler
   app.use((_req, res) => {
