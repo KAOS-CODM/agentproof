@@ -35,6 +35,24 @@ export interface CreateOrderInput {
   invoiceId: string;
 }
 
+export interface PayPalOrderDetails {
+  id: string;
+  status: string;
+  intent: string | null;
+  invoiceId: string | null;
+  amount: number | null;
+  currency: string | null;
+}
+
+export interface PayPalCaptureResult {
+  orderId: string;
+  orderStatus: string;
+  captureId: string | null;
+  captureStatus: string | null;
+  amount: number | null;
+  currency: string | null;
+}
+
 interface TokenCacheEntry {
   accessToken: string;
   expiresAt: number;
@@ -182,6 +200,113 @@ export class PayPalClient {
     const approve = links.find((l) => l.rel === 'approve');
 
     return { id: json.id, status: json.status, approveUrl: approve?.href ?? null, rawLinks: links };
+  }
+
+  async getOrder(orderId: string): Promise<PayPalOrderDetails> {
+    const token = await this.getAccessToken();
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/v2/checkout/orders/${encodeURIComponent(orderId)}`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (err) {
+      throw toPayPalError(err, 'Get order request failed');
+    }
+
+    const debugId = response.headers.get('paypal-debug-id');
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new PayPalError(`Get order failed with status ${response.status}: ${safeTruncate(body)}`, response.status, debugId);
+    }
+
+    const json = (await response.json().catch(() => null)) as {
+      id?: unknown;
+      status?: unknown;
+      intent?: unknown;
+      purchase_units?: unknown;
+    } | null;
+
+    if (!json || typeof json.id !== 'string' || typeof json.status !== 'string') {
+      throw new PayPalError('Get order response malformed', response.status, debugId);
+    }
+
+    const unit = Array.isArray(json.purchase_units)
+      ? (json.purchase_units[0] as { invoice_id?: unknown; amount?: { currency_code?: unknown; value?: unknown } } | undefined)
+      : undefined;
+    const amountValue = unit?.amount?.value;
+    const amount = typeof amountValue === 'string' ? parseFloat(amountValue) : NaN;
+
+    return {
+      id: json.id,
+      status: json.status,
+      intent: typeof json.intent === 'string' ? json.intent : null,
+      invoiceId: unit && typeof unit.invoice_id === 'string' ? unit.invoice_id : null,
+      amount: Number.isFinite(amount) ? amount : null,
+      currency: unit && typeof unit.amount?.currency_code === 'string' ? unit.amount.currency_code : null,
+    };
+  }
+
+  async captureOrder(orderId: string): Promise<PayPalCaptureResult> {
+    const token = await this.getAccessToken();
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: '{}',
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (err) {
+      throw toPayPalError(err, 'Capture request failed');
+    }
+
+    const debugId = response.headers.get('paypal-debug-id');
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new PayPalError(`Capture failed with status ${response.status}: ${safeTruncate(body)}`, response.status, debugId);
+    }
+
+    const json = (await response.json().catch(() => null)) as {
+      id?: unknown;
+      status?: unknown;
+      purchase_units?: unknown;
+    } | null;
+
+    if (!json || typeof json.id !== 'string' || typeof json.status !== 'string') {
+      throw new PayPalError('Capture response malformed', response.status, debugId);
+    }
+
+    const unit = Array.isArray(json.purchase_units)
+      ? (json.purchase_units[0] as { payments?: { captures?: unknown } } | undefined)
+      : undefined;
+    const captures = unit?.payments?.captures;
+    const capture = Array.isArray(captures)
+      ? (captures[0] as { id?: unknown; status?: unknown; amount?: { currency_code?: unknown; value?: unknown } } | undefined)
+      : undefined;
+    const amountValue = capture?.amount?.value;
+    const amount = typeof amountValue === 'string' ? parseFloat(amountValue) : NaN;
+
+    return {
+      orderId: json.id,
+      orderStatus: json.status,
+      captureId: capture && typeof capture.id === 'string' ? capture.id : null,
+      captureStatus: capture && typeof capture.status === 'string' ? capture.status : null,
+      amount: Number.isFinite(amount) ? amount : null,
+      currency: capture && typeof capture.amount?.currency_code === 'string' ? capture.amount.currency_code : null,
+    };
   }
 }
 

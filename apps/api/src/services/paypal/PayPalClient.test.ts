@@ -15,6 +15,70 @@ function stubFetchSequence(responses: Array<() => unknown>) {
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe('PayPalClient getOrder / captureOrder', () => {
+  it('successful order retrieval returns typed details', async () => {
+    const mock = stubFetchSequence([
+      tokenResponse,
+      () => ({
+        ok: true, headers: new Headers(),
+        json: async () => ({
+          id: 'O-1', status: 'APPROVED', intent: 'CAPTURE',
+          purchase_units: [{ invoice_id: 'inv-1', amount: { currency_code: 'USD', value: '99.00' } }],
+        }),
+      }),
+    ]);
+
+    const order = await client().getOrder('O-1');
+    expect(order.id).toBe('O-1');
+    expect(order.status).toBe('APPROVED');
+    expect(order.invoiceId).toBe('inv-1');
+    expect(order.amount).toBe(99);
+    expect(order.currency).toBe('USD');
+    expect(String(mock.mock.calls[1][0])).toBe('https://api-m.sandbox.paypal.com/v2/checkout/orders/O-1');
+  });
+
+  it('successful capture returns typed capture result', async () => {
+    stubFetchSequence([
+      tokenResponse,
+      () => ({
+        ok: true, headers: new Headers(),
+        json: async () => ({
+          id: 'O-1', status: 'COMPLETED',
+          purchase_units: [{ payments: { captures: [{ id: 'CAP-1', status: 'COMPLETED', amount: { currency_code: 'USD', value: '99.00' } }] } }],
+        }),
+      }),
+    ]);
+
+    const capture = await client().captureOrder('O-1');
+    expect(capture.orderId).toBe('O-1');
+    expect(capture.orderStatus).toBe('COMPLETED');
+    expect(capture.captureId).toBe('CAP-1');
+    expect(capture.captureStatus).toBe('COMPLETED');
+    expect(capture.amount).toBe(99);
+  });
+
+  it('capture failure surfaces PayPal error with debug id', async () => {
+    stubFetchSequence([
+      tokenResponse,
+      () => ({ ok: false, status: 422, headers: new Headers({ 'paypal-debug-id': 'dbg-c' }), text: async () => 'ORDER_ALREADY_CAPTURED' }),
+    ]);
+
+    const err = await client().captureOrder('O-1').catch((e) => e);
+    expect(err).toBeInstanceOf(PayPalError);
+    expect(err.message).toContain('422');
+    expect(err.debugId).toBe('dbg-c');
+  });
+
+  it('malformed get-order response throws', async () => {
+    stubFetchSequence([
+      tokenResponse,
+      () => ({ ok: true, headers: new Headers(), json: async () => ({ nope: 1 }) }),
+    ]);
+
+    await expect(client().getOrder('O-1')).rejects.toThrow('malformed');
+  });
+});
+
 describe('PayPalClient OAuth', () => {
   it('1. acquires a token via client credentials with Basic auth', async () => {
     const mock = stubFetchSequence([
