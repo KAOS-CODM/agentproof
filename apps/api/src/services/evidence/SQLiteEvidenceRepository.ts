@@ -3,6 +3,7 @@ import type { EvidenceRepository } from './EvidenceRepository.js';
 
 interface EvidenceRow {
   id: string;
+  user_id?: string | null;
   event_type: string;
   timestamp: string;
   actor: string;
@@ -43,6 +44,30 @@ function toEvidenceRow(value: unknown): EvidenceRow {
   };
 }
 
+function insertValues(record: EvidenceRecord, userId?: string | null): Array<string | null> {
+  return [
+    record.id,
+    userId ?? null,
+    record.eventType,
+    record.timestamp,
+    record.actor,
+    record.transactionId,
+    record.intentId,
+    record.approvalRequestId,
+    record.policyEvaluationId,
+    JSON.stringify(record.data),
+    JSON.stringify(record.metadata),
+  ];
+}
+
+/**
+ * sql.js-backed implementation of the evidence repository.
+ *
+ * Internally every operation is synchronous (sql.js executes in-process), but
+ * the public contract is Promise-based so it is interchangeable with an
+ * asynchronous MongoDB implementation later. The Promises resolve with the
+ * already-computed value; no work is deferred.
+ */
 export class SQLiteEvidenceRepository implements EvidenceRepository {
   private db: SqlJsDatabase;
 
@@ -50,31 +75,84 @@ export class SQLiteEvidenceRepository implements EvidenceRepository {
     this.db = db;
   }
 
-  append(record: EvidenceRecord): void {
+  async append(record: EvidenceRecord, userId?: string | null): Promise<void> {
     this.db.run(
       `INSERT INTO evidence_records (
-        id, event_type, timestamp, actor,
+        id, user_id, event_type, timestamp, actor,
         transaction_id, intent_id, approval_request_id, policy_evaluation_id,
         data_json, metadata_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        record.id,
-        record.eventType,
-        record.timestamp,
-        record.actor,
-        record.transactionId,
-        record.intentId,
-        record.approvalRequestId,
-        record.policyEvaluationId,
-        JSON.stringify(record.data),
-        JSON.stringify(record.metadata),
-      ],
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      insertValues(record, userId),
     );
   }
 
-  getById(id: string): EvidenceRecord | null {
-    const stmt = this.db.prepare('SELECT * FROM evidence_records WHERE id = ?');
+  /**
+   * `ON CONFLICT(id) DO NOTHING` scopes idempotency to the primary key only: a
+   * duplicate id is a no-op, while unrelated constraint violations still raise.
+   * `getRowsModified()` distinguishes the insert from the no-op atomically.
+   */
+  async appendIfAbsent(
+    record: EvidenceRecord,
+    userId?: string | null,
+  ): Promise<'created' | 'exists'> {
+    this.db.run(
+      `INSERT INTO evidence_records (
+        id, user_id, event_type, timestamp, actor,
+        transaction_id, intent_id, approval_request_id, policy_evaluation_id,
+        data_json, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING`,
+      insertValues(record, userId),
+    );
+    return this.db.getRowsModified() > 0 ? 'created' : 'exists';
+  }
+
+  async getById(id: string): Promise<EvidenceRecord | null> {
+    return this.selectOne('id = ?', [id]);
+  }
+
+  async getByIdForUser(id: string, userId: string): Promise<EvidenceRecord | null> {
+    return this.selectOne('id = ? AND user_id = ?', [id, userId]);
+  }
+
+  async getByIntentId(intentId: string): Promise<EvidenceRecord[]> {
+    return this.selectMany('intent_id = ?', [intentId]);
+  }
+
+  async getByIntentIdForUser(intentId: string, userId: string): Promise<EvidenceRecord[]> {
+    return this.selectMany('intent_id = ? AND user_id = ?', [intentId, userId]);
+  }
+
+  async getByTransactionId(transactionId: string): Promise<EvidenceRecord[]> {
+    return this.selectMany('transaction_id = ?', [transactionId]);
+  }
+
+  async getByTransactionIdForUser(
+    transactionId: string,
+    userId: string,
+  ): Promise<EvidenceRecord[]> {
+    return this.selectMany('transaction_id = ? AND user_id = ?', [transactionId, userId]);
+  }
+
+  async getAll(): Promise<EvidenceRecord[]> {
+    return this.selectMany('1 = 1', []);
+  }
+
+  async getAllForUser(userId: string): Promise<EvidenceRecord[]> {
+    return this.selectMany('user_id = ?', [userId]);
+  }
+
+  async exists(id: string): Promise<boolean> {
+    const stmt = this.db.prepare('SELECT 1 FROM evidence_records WHERE id = ? LIMIT 1');
     stmt.bind([id]);
+    const has = stmt.step();
+    stmt.free();
+    return has;
+  }
+
+  private selectOne(where: string, values: string[]): EvidenceRecord | null {
+    const stmt = this.db.prepare(`SELECT * FROM evidence_records WHERE ${where}`);
+    stmt.bind(values);
     let row: unknown = null;
     if (stmt.step()) {
       row = stmt.getAsObject();
@@ -83,42 +161,17 @@ export class SQLiteEvidenceRepository implements EvidenceRepository {
     return row ? this.rowToRecord(toEvidenceRow(row)) : null;
   }
 
-  getByIntentId(intentId: string): EvidenceRecord[] {
+  private selectMany(where: string, values: string[]): EvidenceRecord[] {
     const stmt = this.db.prepare(
-      'SELECT * FROM evidence_records WHERE intent_id = ? ORDER BY timestamp ASC',
+      `SELECT * FROM evidence_records WHERE ${where} ORDER BY timestamp ASC`,
     );
-    stmt.bind([intentId]);
+    stmt.bind(values);
     const rows: EvidenceRow[] = [];
     while (stmt.step()) {
       rows.push(toEvidenceRow(stmt.getAsObject()));
     }
     stmt.free();
-    return rows.map((r) => this.rowToRecord(r));
-  }
-
-  getByTransactionId(transactionId: string): EvidenceRecord[] {
-    const stmt = this.db.prepare(
-      'SELECT * FROM evidence_records WHERE transaction_id = ? ORDER BY timestamp ASC',
-    );
-    stmt.bind([transactionId]);
-    const rows: EvidenceRow[] = [];
-    while (stmt.step()) {
-      rows.push(toEvidenceRow(stmt.getAsObject()));
-    }
-    stmt.free();
-    return rows.map((r) => this.rowToRecord(r));
-  }
-
-  getAll(): EvidenceRecord[] {
-    const stmt = this.db.prepare(
-      'SELECT * FROM evidence_records ORDER BY timestamp ASC',
-    );
-    const rows: EvidenceRow[] = [];
-    while (stmt.step()) {
-      rows.push(toEvidenceRow(stmt.getAsObject()));
-    }
-    stmt.free();
-    return rows.map((r) => this.rowToRecord(r));
+    return rows.map((row) => this.rowToRecord(row));
   }
 
   private rowToRecord(row: EvidenceRow): EvidenceRecord {

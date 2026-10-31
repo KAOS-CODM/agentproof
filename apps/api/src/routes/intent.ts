@@ -1,16 +1,14 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { intentCreateSchema } from '@agentproof/shared';
-import { getDb } from '../models/db.js';
-import { EvidenceService } from '../services/evidence/EvidenceService.js';
-import { SQLiteEvidenceRepository } from '../services/evidence/SQLiteEvidenceRepository.js';
-import { AIService } from '../services/ai/AIService.js';
+import { getIntentRepository, getEvidenceService, getIntentParser } from '../models/repositories.js';
+import { detectCompoundIntent } from '../services/discovery/compoundGuard.js';
 import { generateId } from '../utils/id.js';
 import { logger } from '../utils/logger.js';
+import { requireAuth } from '../middleware/auth.js';
 
 export const intentRouter = Router();
-
-const aiService = new AIService();
+intentRouter.use(requireAuth);
 
 intentRouter.post('/', async (req, res) => {
   const parsed = intentCreateSchema.safeParse(req.body);
@@ -19,8 +17,8 @@ intentRouter.post('/', async (req, res) => {
     return;
   }
 
-  const db = getDb();
-  const evidenceService = new EvidenceService(new SQLiteEvidenceRepository(db));
+  const intentRepository = getIntentRepository();
+  const evidenceService = getEvidenceService();
 
   const { rawInput } = parsed.data;
   const id = generateId();
@@ -30,55 +28,78 @@ intentRouter.post('/', async (req, res) => {
 
   if (!structured) {
     try {
-      const parsedIntent = await aiService.parseIntent(rawInput);
+      const parsedIntent = await getIntentParser().parseIntent(rawInput);
       structured = parsedIntent.structured;
 
-      evidenceService.record({
-        eventType: 'INTENT_PARSED',
-        actor: 'llm',
-        source: 'openrouter',
-        intentId: id,
-        data: { rawInput, structured, model: parsedIntent.model },
-      });
+      // Deterministic safeguard: if the LLM omitted or mis-set isCompound,
+      // detect compound requests directly from the raw input.
+      if (!structured.isCompound && detectCompoundIntent(rawInput)) {
+        structured = { ...structured, isCompound: true };
+      }
+
+      await evidenceService.record(
+        {
+          eventType: 'INTENT_PARSED',
+          actor: 'llm',
+          source: 'openrouter',
+          intentId: id,
+          data: { rawInput, structured, model: parsedIntent.model },
+        },
+        req.auth!.user.id,
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : 'AI intent parsing failed';
       logger.error('AI intent parsing failed', { error: message });
 
-      evidenceService.record({
-        eventType: 'INTENT_PARSED',
-        actor: 'llm',
-        source: 'openrouter',
-        intentId: id,
-        data: { rawInput, error: message },
-      });
+      await evidenceService.record(
+        {
+          eventType: 'INTENT_PARSED',
+          actor: 'llm',
+          source: 'openrouter',
+          intentId: id,
+          data: { rawInput, error: message },
+        },
+        req.auth!.user.id,
+      );
 
       res.status(502).json({ error: 'AI intent parsing failed', details: message });
       return;
     }
   }
 
-  db.run(
-    `INSERT INTO intents (id, raw_input, structured_json, status, created_at, parsed_at, validated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [id, rawInput, JSON.stringify(structured), 'VALIDATED', now, now, now],
+  await intentRepository.create({
+    id,
+    userId: req.auth!.user.id,
+    rawInput,
+    structured,
+    status: 'VALIDATED',
+    createdAt: now,
+    parsedAt: now,
+    validatedAt: now,
+  });
+
+  // Record evidence (owned by the authenticated user)
+  await evidenceService.record(
+    {
+      eventType: 'INTENT_CREATED',
+      actor: 'user',
+      source: 'user_input',
+      intentId: id,
+      data: { rawInput },
+    },
+    req.auth!.user.id,
   );
 
-  // Record evidence
-  evidenceService.record({
-    eventType: 'INTENT_CREATED',
-    actor: 'user',
-    source: 'user_input',
-    intentId: id,
-    data: { rawInput },
-  });
-
-  evidenceService.record({
-    eventType: 'INTENT_VALIDATED',
-    actor: 'policy_engine',
-    source: 'policy_engine',
-    intentId: id,
-    data: { structured },
-  });
+  await evidenceService.record(
+    {
+      eventType: 'INTENT_VALIDATED',
+      actor: 'policy_engine',
+      source: 'policy_engine',
+      intentId: id,
+      data: { structured },
+    },
+    req.auth!.user.id,
+  );
 
   logger.info('Intent created', { intentId: id });
 
@@ -91,39 +112,28 @@ intentRouter.post('/', async (req, res) => {
   });
 });
 
-intentRouter.get('/:id', (req, res) => {
-  const db = getDb();
+intentRouter.get('/', async (req, res) => {
+  const intentRepository = getIntentRepository();
+  const userId = req.auth!.user.id;
 
-  const stmt = db.prepare('SELECT * FROM intents WHERE id = ?');
-  stmt.bind([req.params.id]);
-  let row: unknown = null;
-  if (stmt.step()) {
-    row = stmt.getAsObject();
-  }
-  stmt.free();
+  const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : NaN;
+  const limit =
+    Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 50) : 25;
 
-  if (!row) {
+  const intents = await intentRepository.listForUser(userId, limit);
+  res.json(intents);
+});
+
+intentRouter.get('/:id', async (req, res) => {
+  const intentRepository = getIntentRepository();
+  const userId = req.auth!.user.id;
+
+  const intent = await intentRepository.getByIdForUser(req.params.id, userId);
+
+  if (!intent) {
     res.status(404).json({ error: 'Intent not found' });
     return;
   }
 
-  const r = row as {
-    id: string;
-    raw_input: string;
-    structured_json: string;
-    status: string;
-    created_at: string;
-    parsed_at: string | null;
-    validated_at: string | null;
-  };
-
-  res.json({
-    id: r.id,
-    rawInput: r.raw_input,
-    structured: JSON.parse(r.structured_json),
-    status: r.status,
-    createdAt: r.created_at,
-    parsedAt: r.parsed_at,
-    validatedAt: r.validated_at,
-  });
+  res.json(intent);
 });

@@ -10,6 +10,7 @@ export const constraintSchema = z.object({
 
 export const structuredIntentSchema = z.object({
   purpose: z.string().min(1),
+  isCompound: z.boolean().optional(),
   maxAmount: z.number().positive(),
   currency: z.string().length(3),
   brands: z.array(z.string()),
@@ -44,10 +45,48 @@ export const productSchema = z.object({
   price: z.number().positive(),
   currency: z.string().length(3),
   brand: z.string().min(1),
-  condition: z.enum(['new', 'used']),
+  // `unknown` means the provider could not establish condition reliably (e.g.
+  // a Channel3 offer whose condition is null or "refurbished"). The
+  // deterministic PolicyEngine fails closed on `unknown` for new/used intents,
+  // so an unverified condition is never treated as new.
+  condition: z.enum(['new', 'used', 'unknown']),
   category: z.string().min(1),
+  // Optional fields preserved from real product providers (e.g. Channel3).
+  // Absent values are omitted entirely - never fabricated or defaulted.
+  merchant: z.string().min(1).optional(),
+  imageUrl: z.string().min(1).optional(),
+  productUrl: z.string().min(1).optional(),
+  availability: z.enum(['InStock', 'OutOfStock', 'Unknown']).optional(),
+  externalId: z.string().min(1).optional(),
+  brandId: z.string().min(1).optional(),
   metadata: z.record(z.unknown()).optional(),
 });
+
+// ── Offer snapshots ─────────────────────────────────────────────────────────
+
+/**
+ * Public, browser-safe view of an immutable offer snapshot. The raw retailer
+ * URL is deliberately excluded: it is only returned by the explicit handoff
+ * endpoint after the server has re-checked ownership and URL safety.
+ */
+export const offerSnapshotViewSchema = z.object({
+  id: z.string().min(1),
+  source: z.enum(['channel3', 'demo_catalog']),
+  productId: z.string().min(1),
+  externalProductId: z.string().min(1).nullable(),
+  productName: z.string().min(1),
+  brand: z.string().min(1),
+  merchant: z.string().min(1).nullable(),
+  price: z.number().positive(),
+  currency: z.string().length(3),
+  availability: z.enum(['InStock', 'OutOfStock', 'Unknown']).nullable(),
+  condition: z.enum(['new', 'used', 'unknown']).nullable(),
+  compareAtPrice: z.number().positive().nullable(),
+  maxCommissionRate: z.number().nonnegative().nullable(),
+  capturedAt: z.string().min(1),
+});
+
+export type OfferSnapshotView = z.infer<typeof offerSnapshotViewSchema>;
 
 // ── Policy ──────────────────────────────────────────────────────────────────
 
