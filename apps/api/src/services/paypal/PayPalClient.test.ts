@@ -147,6 +147,48 @@ describe('PayPalClient createOrder', () => {
     expect(body.purchase_units[0].invoice_id).toBe('inv-9');
   });
 
+  it('4b. order creation includes return_url and cancel_url when provided', async () => {
+    const mock = stubFetchSequence([
+      tokenResponse,
+      () => ({
+        ok: true, headers: new Headers(),
+        json: async () => ({ id: 'O-XYZ', status: 'CREATED', links: [{ rel: 'approve', href: 'https://paypal.com/approve/O-XYZ' }] }),
+      }),
+    ]);
+
+    await client().createOrder({
+      amount: 99.5,
+      currency: 'USD',
+      description: 'Shoe',
+      invoiceId: 'inv-9',
+      returnUrl: 'http://localhost:5173/payment/return',
+      cancelUrl: 'http://localhost:5173/payment/cancel',
+    });
+
+    const [, init] = mock.mock.calls[1] as unknown as [string, { body: string; headers: Record<string, string> }];
+    const body = JSON.parse(init.body);
+    expect(body.application_context).toEqual({
+      return_url: 'http://localhost:5173/payment/return',
+      cancel_url: 'http://localhost:5173/payment/cancel',
+    });
+  });
+
+  it('4c. order creation omits application_context when no return/cancel URLs', async () => {
+    const mock = stubFetchSequence([
+      tokenResponse,
+      () => ({
+        ok: true, headers: new Headers(),
+        json: async () => ({ id: 'O-XYZ', status: 'CREATED', links: [] }),
+      }),
+    ]);
+
+    await client().createOrder({ amount: 99.5, currency: 'USD', description: 'Shoe', invoiceId: 'inv-9' });
+
+    const [, init] = mock.mock.calls[1] as unknown as [string, { body: string; headers: Record<string, string> }];
+    const body = JSON.parse(init.body);
+    expect(body.application_context).toBeUndefined();
+  });
+
   it('5. PayPal non-2xx order response yields clear error with debug id', async () => {
     stubFetchSequence([
       tokenResponse,
@@ -184,5 +226,69 @@ describe('PayPalClient createOrder', () => {
     const err = await client().createOrder({ amount: 1, currency: 'USD', description: 'x', invoiceId: 'i' }).catch((e) => e);
     expect(err.message).not.toContain('tok-abc');
     expect(err.message).not.toContain('Bearer');
+  });
+});
+
+function fetchFailedError(cause?: Record<string, unknown>): TypeError {
+  const err = new TypeError('fetch failed');
+  if (cause) (err as { cause?: unknown }).cause = cause;
+  return err;
+}
+
+describe('PayPalClient transport diagnostics', () => {
+  it('appends safe transport diagnostics when cause.code is present', async () => {
+    stubFetchSequence([
+      () => {
+        throw fetchFailedError({ code: 'EAI_AGAIN', syscall: 'getaddrinfo', hostname: 'api-m.sandbox.paypal.com' });
+      },
+    ]);
+
+    const err = await client()
+      .createOrder({ amount: 1, currency: 'USD', description: 'x', invoiceId: 'i' })
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(PayPalError);
+    expect(err.status).toBeNull();
+    expect(err.message).toContain('OAuth token request failed: fetch failed');
+    expect(err.message).toContain('name=TypeError');
+    expect(err.message).toContain('code=EAI_AGAIN');
+    expect(err.message).toContain('syscall=getaddrinfo');
+    expect(err.message).toContain('hostname=api-m.sandbox.paypal.com');
+    expect(err.message).not.toContain('test-secret-value');
+  });
+
+  it('preserves the base message when no cause.code is available', async () => {
+    stubFetchSequence([
+      () => {
+        throw fetchFailedError();
+      },
+    ]);
+
+    const err = await client()
+      .createOrder({ amount: 1, currency: 'USD', description: 'x', invoiceId: 'i' })
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(PayPalError);
+    expect(err.message).toContain('OAuth token request failed: fetch failed');
+    expect(err.message).toContain('name=TypeError');
+    expect(err.message).not.toContain('code=');
+    expect(err.message).not.toContain('test-secret-value');
+  });
+
+  it('does not misreport transport failures as HTTP/auth rejections', async () => {
+    stubFetchSequence([
+      () => {
+        throw fetchFailedError({ code: 'ECONNREFUSED' });
+      },
+    ]);
+
+    const err = await client()
+      .createOrder({ amount: 1, currency: 'USD', description: 'x', invoiceId: 'i' })
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(PayPalError);
+    expect(err.status).toBeNull();
+    expect(err.message).not.toContain('status 401');
+    expect(err.message).toContain('code=ECONNREFUSED');
   });
 });

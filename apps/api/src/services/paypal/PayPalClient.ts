@@ -1,4 +1,5 @@
 import { config } from '../../config/env.js';
+import { formatTransportDiagnostic } from '../../utils/transportDiagnostics.js';
 
 const TOKEN_EXPIRY_SKEW_MS = 60_000;
 
@@ -33,6 +34,8 @@ export interface CreateOrderInput {
   currency: string;
   description: string;
   invoiceId: string;
+  returnUrl?: string;
+  cancelUrl?: string;
 }
 
 export interface PayPalOrderDetails {
@@ -163,6 +166,14 @@ export class PayPalClient {
               },
             },
           ],
+          ...(input.returnUrl || input.cancelUrl
+            ? {
+                application_context: {
+                  ...(input.returnUrl ? { return_url: input.returnUrl } : {}),
+                  ...(input.cancelUrl ? { cancel_url: input.cancelUrl } : {}),
+                },
+              }
+            : {}),
         }),
         signal: AbortSignal.timeout(30_000),
       });
@@ -319,5 +330,9 @@ function toPayPalError(err: unknown, prefix: string): PayPalError {
     return new PayPalError(`${prefix}: request timed out`);
   }
   if (err instanceof PayPalError) return err;
-  return new PayPalError(`${prefix}: ${err instanceof Error ? err.message : 'unknown error'}`);
+  // Diagnostic-only: append safe transport identifiers (name, cause.code,
+  // cause.syscall, cause.hostname) without changing the error type, status,
+  // or the base message. HTTP/auth rejections never reach this path.
+  const message = err instanceof Error ? err.message : 'unknown error';
+  return new PayPalError(`${prefix}: ${message}${formatTransportDiagnostic(err)}`);
 }
