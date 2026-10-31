@@ -85,6 +85,184 @@ describe('PolicyEngine', () => {
       const brandRule = result.ruleResults.find((r) => r.rule === 'BRAND')!;
       expect(brandRule.passed).toBe(true);
     });
+
+    it('matches the brand case-insensitively ("Adidas" vs "adidas")', () => {
+      const result = engine.evaluate(
+        makeIntent({ brands: ['Adidas'] }),
+        makeProduct({ brand: 'adidas' }),
+      );
+      const brandRule = result.ruleResults.find((r) => r.rule === 'BRAND')!;
+      expect(brandRule.passed).toBe(true);
+      expect(brandRule.actual).toBe('adidas');
+      expect(brandRule.expected).toBe('Adidas');
+      expect(result.result).toBe('ALLOW');
+    });
+
+    it('trims surrounding whitespace on both the intent and the product brand', () => {
+      const result = engine.evaluate(
+        makeIntent({ brands: ['  NIKE  '] }),
+        makeProduct({ brand: ' Nike ' }),
+      );
+      const brandRule = result.ruleResults.find((r) => r.rule === 'BRAND')!;
+      expect(brandRule.passed).toBe(true);
+    });
+
+    it('still rejects a genuinely different brand (exact match, not substring)', () => {
+      const result = engine.evaluate(
+        makeIntent({ brands: ['Adidas'] }),
+        makeProduct({ brand: 'Adidas Originals' }),
+      );
+      const brandRule = result.ruleResults.find((r) => r.rule === 'BRAND')!;
+      expect(brandRule.passed).toBe(false);
+      expect(brandRule.reason).toBe('BRAND_NOT_IN_INTENT');
+      expect(result.result).toBe('DENY');
+    });
+
+    it('rejects an empty product brand when a brand is required', () => {
+      const result = engine.evaluate(
+        makeIntent({ brands: ['Adidas'] }),
+        makeProduct({ brand: '' }),
+      );
+      const brandRule = result.ruleResults.find((r) => r.rule === 'BRAND')!;
+      expect(brandRule.passed).toBe(false);
+      expect(brandRule.reason).toBe('BRAND_NOT_IN_INTENT');
+      expect(result.result).toBe('DENY');
+    });
+
+    it('rejects a whitespace-only product brand when a brand is required', () => {
+      const result = engine.evaluate(
+        makeIntent({ brands: ['Adidas'] }),
+        makeProduct({ brand: '   ' }),
+      );
+      const brandRule = result.ruleResults.find((r) => r.rule === 'BRAND')!;
+      expect(brandRule.passed).toBe(false);
+    });
+
+    it('does not treat a missing product brand as a match', () => {
+      const result = engine.evaluate(
+        makeIntent({ brands: ['Adidas'] }),
+        makeProduct({ brand: undefined as unknown as string }),
+      );
+      const brandRule = result.ruleResults.find((r) => r.rule === 'BRAND')!;
+      expect(brandRule.passed).toBe(false);
+      expect(brandRule.reason).toBe('BRAND_NOT_IN_INTENT');
+    });
+  });
+
+  describe('CURRENCY rule', () => {
+    it('allows a product whose currency matches the intent', () => {
+      const result = engine.evaluate(
+        makeIntent({ currency: 'USD' }),
+        makeProduct({ currency: 'USD' }),
+      );
+      const currencyRule = result.ruleResults.find((r) => r.rule === 'CURRENCY')!;
+      expect(currencyRule.passed).toBe(true);
+      expect(result.result).toBe('ALLOW');
+    });
+
+    it('compares currency case-insensitively and tolerates whitespace', () => {
+      const result = engine.evaluate(
+        makeIntent({ currency: 'usd' }),
+        makeProduct({ currency: ' USD ' }),
+      );
+      const currencyRule = result.ruleResults.find((r) => r.rule === 'CURRENCY')!;
+      expect(currencyRule.passed).toBe(true);
+      expect(currencyRule.actual).toBe('USD');
+      expect(currencyRule.expected).toBe('USD');
+    });
+
+    it('rejects a currency mismatch even when the numeric price is within the limit', () => {
+      const result = engine.evaluate(
+        makeIntent({ currency: 'USD', maxAmount: 150 }),
+        makeProduct({ currency: 'EUR', price: 100 }),
+      );
+      const currencyRule = result.ruleResults.find((r) => r.rule === 'CURRENCY')!;
+      expect(currencyRule.passed).toBe(false);
+      expect(currencyRule.reason).toBe('CURRENCY_MISMATCH');
+      expect(currencyRule.actual).toBe('EUR');
+      expect(currencyRule.expected).toBe('USD');
+      // The numeric price rule still passes; the currency mismatch alone denies.
+      expect(result.ruleResults.find((r) => r.rule === 'PRICE')!.passed).toBe(true);
+      expect(result.result).toBe('DENY');
+    });
+
+    it('rejects a currency mismatch when the numeric price is also above the limit', () => {
+      const result = engine.evaluate(
+        makeIntent({ currency: 'USD', maxAmount: 150 }),
+        makeProduct({ currency: 'EUR', price: 200 }),
+      );
+      expect(result.result).toBe('DENY');
+      const failed = result.ruleResults.filter((r) => !r.passed).map((r) => r.rule);
+      expect(failed).toContain('CURRENCY');
+      expect(failed).toContain('PRICE');
+    });
+
+    it('fails closed when the product currency is missing', () => {
+      const result = engine.evaluate(
+        makeIntent({ currency: 'USD' }),
+        makeProduct({ currency: undefined as unknown as string }),
+      );
+      const currencyRule = result.ruleResults.find((r) => r.rule === 'CURRENCY')!;
+      expect(currencyRule.passed).toBe(false);
+      expect(currencyRule.reason).toBe('PRODUCT_CURRENCY_INVALID');
+      expect(result.result).toBe('DENY');
+    });
+
+    it('fails closed when the product currency is empty or malformed', () => {
+      const empty = engine.evaluate(makeIntent({ currency: 'USD' }), makeProduct({ currency: '' }));
+      const emptyRule = empty.ruleResults.find((r) => r.rule === 'CURRENCY')!;
+      expect(emptyRule.passed).toBe(false);
+      expect(emptyRule.reason).toBe('PRODUCT_CURRENCY_INVALID');
+
+      const malformed = engine.evaluate(
+        makeIntent({ currency: 'USD' }),
+        makeProduct({ currency: 'US' }),
+      );
+      const malformedRule = malformed.ruleResults.find((r) => r.rule === 'CURRENCY')!;
+      expect(malformedRule.passed).toBe(false);
+      expect(malformedRule.reason).toBe('PRODUCT_CURRENCY_INVALID');
+      expect(malformed.result).toBe('DENY');
+    });
+
+    it('fails closed when the intent currency is missing or invalid', () => {
+      const missing = engine.evaluate(makeIntent({ currency: '' }), makeProduct({ currency: 'USD' }));
+      const missingRule = missing.ruleResults.find((r) => r.rule === 'CURRENCY')!;
+      expect(missingRule.passed).toBe(false);
+      expect(missingRule.reason).toBe('INTENT_CURRENCY_INVALID');
+      expect(missing.result).toBe('DENY');
+
+      const invalid = engine.evaluate(
+        makeIntent({ currency: 'US' }),
+        makeProduct({ currency: 'US' }),
+      );
+      const invalidRule = invalid.ruleResults.find((r) => r.rule === 'CURRENCY')!;
+      expect(invalidRule.passed).toBe(false);
+      expect(invalidRule.reason).toBe('INTENT_CURRENCY_INVALID');
+      expect(invalid.result).toBe('DENY');
+    });
+
+    it('never ALLOWs on a currency mismatch even with otherwise valid brand, condition, purpose, and price', () => {
+      const result = engine.evaluate(
+        makeIntent({
+          currency: 'USD',
+          maxAmount: 150,
+          brands: ['Nike'],
+          condition: 'new',
+          purpose: 'running shoes',
+        }),
+        makeProduct({
+          currency: 'EUR',
+          brand: 'Nike',
+          condition: 'new',
+          category: 'running shoes',
+          price: 79,
+        }),
+      );
+      expect(result.result).toBe('DENY');
+      // Exactly one rule fails: CURRENCY. Everything else would have allowed.
+      const failed = result.ruleResults.filter((r) => !r.passed).map((r) => r.rule);
+      expect(failed).toEqual(['CURRENCY']);
+    });
   });
 
   describe('CONDITION rule', () => {
@@ -112,6 +290,36 @@ describe('PolicyEngine', () => {
       const result = engine.evaluate(
         makeIntent({ condition: 'any' }),
         makeProduct({ condition: 'used' }),
+      );
+      const conditionRule = result.ruleResults.find((r) => r.rule === 'CONDITION')!;
+      expect(conditionRule.passed).toBe(true);
+    });
+
+    it('fails closed on an unknown condition when intent requires new', () => {
+      const result = engine.evaluate(
+        makeIntent({ condition: 'new' }),
+        makeProduct({ condition: 'unknown' }),
+      );
+      const conditionRule = result.ruleResults.find((r) => r.rule === 'CONDITION')!;
+      expect(conditionRule.passed).toBe(false);
+      expect(conditionRule.reason).toBe('CONDITION_MISMATCH');
+      expect(result.result).toBe('DENY');
+    });
+
+    it('fails closed on an unknown condition when intent requires used', () => {
+      const result = engine.evaluate(
+        makeIntent({ condition: 'used', brands: [] }),
+        makeProduct({ condition: 'unknown', brand: 'Puma' }),
+      );
+      const conditionRule = result.ruleResults.find((r) => r.rule === 'CONDITION')!;
+      expect(conditionRule.passed).toBe(false);
+      expect(conditionRule.reason).toBe('CONDITION_MISMATCH');
+    });
+
+    it('allows an unknown condition only when intent specifies any', () => {
+      const result = engine.evaluate(
+        makeIntent({ condition: 'any' }),
+        makeProduct({ condition: 'unknown' }),
       );
       const conditionRule = result.ruleResults.find((r) => r.rule === 'CONDITION')!;
       expect(conditionRule.passed).toBe(true);
@@ -146,6 +354,34 @@ describe('PolicyEngine', () => {
       );
       const purposeRule = result.ruleResults.find((r) => r.rule === 'PURPOSE')!;
       expect(purposeRule.passed).toBe(true);
+    });
+
+    it('matches "buy a watch" against Smartwatches category', () => {
+      const result = engine.evaluate(
+        makeIntent({ purpose: 'buy a watch' }),
+        makeProduct({ category: 'Smartwatches', name: 'Samsung Galaxy Watch 7' }),
+      );
+      const purposeRule = result.ruleResults.find((r) => r.rule === 'PURPOSE')!;
+      expect(purposeRule.passed).toBe(true);
+    });
+
+    it('matches "get me a watch" against product name containing watch', () => {
+      const result = engine.evaluate(
+        makeIntent({ purpose: 'get me a watch' }),
+        makeProduct({ category: 'Wearables', name: 'Apple Watch Series 9' }),
+      );
+      const purposeRule = result.ruleResults.find((r) => r.rule === 'PURPOSE')!;
+      expect(purposeRule.passed).toBe(true);
+    });
+
+    it('still denies when no significant purpose keyword matches', () => {
+      const result = engine.evaluate(
+        makeIntent({ purpose: 'running shoes' }),
+        makeProduct({ category: 'Smartwatches', name: 'Samsung Galaxy Watch 7' }),
+      );
+      const purposeRule = result.ruleResults.find((r) => r.rule === 'PURPOSE')!;
+      expect(purposeRule.passed).toBe(false);
+      expect(purposeRule.reason).toBe('PURPOSE_MISMATCH');
     });
   });
 
@@ -209,7 +445,7 @@ describe('PolicyEngine', () => {
     it('returns ALLOW when all rules pass', () => {
       const result = engine.evaluate(makeIntent(), makeProduct());
       expect(result.result).toBe('ALLOW');
-      expect(result.ruleResults).toHaveLength(4);
+      expect(result.ruleResults).toHaveLength(5);
     });
 
     it('returns DENY when any rule fails', () => {

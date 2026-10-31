@@ -5,6 +5,24 @@ export interface PolicyEngineResult {
   evaluation: PolicyEvaluation;
 }
 
+const CURRENCY_PATTERN = /^[A-Z]{3}$/;
+
+/**
+ * Normalized brand key for comparison: trimmed + lower-cased. Returns '' for
+ * missing/non-string values so a missing brand can never accidentally match.
+ */
+function normalizeBrand(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+/**
+ * Normalized currency code: trimmed + upper-cased. Returns '' for
+ * missing/non-string values; '' is never a valid code (see CURRENCY_PATTERN).
+ */
+function normalizeCurrency(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toUpperCase() : '';
+}
+
 /**
  * Deterministic Policy Engine.
  *
@@ -16,23 +34,29 @@ export class PolicyEngine {
   evaluate(intent: StructuredIntent, product: Product): PolicyEvaluation {
     const ruleResults: RuleResult[] = [];
 
-    // Rule 1: PRICE
+    // Rule 1: CURRENCY — currency identity is established BEFORE any monetary
+    // comparison. Comparing prices across currencies is meaningless without a
+    // conversion, which this engine must never perform; a mismatch or an
+    // unverifiable code fails closed and can never contribute to an ALLOW.
+    ruleResults.push(this.evaluateCurrency(intent, product));
+
+    // Rule 2: PRICE
     ruleResults.push(this.evaluatePrice(intent, product));
 
-    // Rule 2: BRAND
+    // Rule 3: BRAND
     ruleResults.push(this.evaluateBrand(intent, product));
 
-    // Rule 3: CONDITION
+    // Rule 4: CONDITION
     ruleResults.push(this.evaluateCondition(intent, product));
 
-    // Rule 4: PURPOSE
+    // Rule 5: PURPOSE
     ruleResults.push(this.evaluatePurpose(intent, product));
 
     // Determine overall result
     const allPassed = ruleResults.every((r) => r.passed);
     const result: 'ALLOW' | 'DENY' = allPassed ? 'ALLOW' : 'DENY';
 
-    // Rule 5: CONFIRMATION_THRESHOLD (only relevant if ALLOW)
+    // Rule 6: CONFIRMATION_THRESHOLD (only relevant if ALLOW)
     let confirmationRequired = false;
     if (allPassed && intent.requiresConfirmationAbove !== null) {
       confirmationRequired = product.price > intent.requiresConfirmationAbove;
@@ -49,6 +73,35 @@ export class PolicyEngine {
     };
   }
 
+  private evaluateCurrency(intent: StructuredIntent, product: Product): RuleResult {
+    // Deterministic currency equality. Both codes are normalized
+    // (trimmed + upper-cased) and must be well-formed 3-letter codes. A
+    // missing, empty, or malformed code fails closed — without a verifiable
+    // currency the engine cannot know the price is comparable, so it must
+    // never silently default to a currency (e.g. USD).
+    const intentCurrency = normalizeCurrency(intent.currency);
+    const productCurrency = normalizeCurrency(product.currency);
+    const intentValid = CURRENCY_PATTERN.test(intentCurrency);
+    const productValid = CURRENCY_PATTERN.test(productCurrency);
+
+    let reason: string | null = null;
+    if (!intentValid) {
+      reason = 'INTENT_CURRENCY_INVALID';
+    } else if (!productValid) {
+      reason = 'PRODUCT_CURRENCY_INVALID';
+    } else if (intentCurrency !== productCurrency) {
+      reason = 'CURRENCY_MISMATCH';
+    }
+
+    return {
+      rule: 'CURRENCY',
+      passed: reason === null,
+      actual: productCurrency,
+      expected: intentCurrency,
+      reason,
+    };
+  }
+
   private evaluatePrice(intent: StructuredIntent, product: Product): RuleResult {
     const passed = product.price <= intent.maxAmount;
     return {
@@ -61,6 +114,7 @@ export class PolicyEngine {
   }
 
   private evaluateBrand(intent: StructuredIntent, product: Product): RuleResult {
+    // An intent with no brands places no brand restriction (unchanged).
     if (intent.brands.length === 0) {
       return {
         rule: 'BRAND',
@@ -70,11 +124,20 @@ export class PolicyEngine {
         reason: null,
       };
     }
-    const passed = intent.brands.includes(product.brand);
+
+    // Match on a normalized key (trim + lower-case) so casing/whitespace
+    // differences such as "Adidas" vs "adidas" no longer cause false
+    // rejections. This remains an exact membership test — no substring or
+    // fuzzy matching — and a missing/empty product brand can never satisfy a
+    // brand-constrained intent.
+    const productBrand = normalizeBrand(product.brand);
+    const allowedBrands = intent.brands.map((brand) => normalizeBrand(brand));
+    const passed = productBrand.length > 0 && allowedBrands.includes(productBrand);
+
     return {
       rule: 'BRAND',
       passed,
-      actual: product.brand,
+      actual: typeof product.brand === 'string' ? product.brand : '',
       expected: intent.brands.join(', '),
       reason: passed ? null : 'BRAND_NOT_IN_INTENT',
     };
@@ -93,16 +156,30 @@ export class PolicyEngine {
   }
 
   private evaluatePurpose(intent: StructuredIntent, product: Product): RuleResult {
-    // Deterministic purpose check: product category must contain the purpose string.
-    // This is intentionally conservative — it fails closed rather than inventing
-    // semantic certainty. Future phases may enhance this with a deterministic
-    // taxonomy or ontology, but it will never be an LLM semantic matcher.
-    const purposeLower = intent.purpose.toLowerCase();
+    // Deterministic purpose check: match significant keywords from the intent
+    // purpose against the product category and name. Stop words are filtered out
+    // so natural language purposes like "buy a watch" match "Smartwatches".
+    // This remains deterministic — no LLM or fuzzy matching involved.
+    const stopWords = new Set([
+      'a', 'an', 'the', 'buy', 'get', 'me', 'i', 'want', 'need', 'please',
+      'can', 'could', 'would', 'should', 'some', 'something', 'for', 'of',
+      'to', 'in', 'on', 'at', 'and', 'or', 'is', 'it', 'this', 'that',
+      'my', 'our', 'your', 'their', 'new', 'used', 'pair', 'any',
+    ]);
+
+    const purposeWords = intent.purpose
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 0 && !stopWords.has(w));
+
     const categoryLower = product.category.toLowerCase();
     const nameLower = product.name.toLowerCase();
 
     const passed =
-      categoryLower.includes(purposeLower) || nameLower.includes(purposeLower);
+      purposeWords.length > 0 &&
+      purposeWords.every(
+        (word) => categoryLower.includes(word) || nameLower.includes(word),
+      );
 
     return {
       rule: 'PURPOSE',

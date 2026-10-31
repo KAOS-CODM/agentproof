@@ -27,7 +27,9 @@ export interface DiscoveryFlowDeps {
   policyEngine: PolicyEngine;
   ai: RecommendableAIService;
   evidence: EvidenceService;
-  persistEvaluation?: (evaluation: PolicyEvaluation) => void;
+  /** Trusted owner attached to every evidence record written by this flow. */
+  userId?: string | null;
+  persistEvaluation?: (evaluation: PolicyEvaluation) => Promise<void>;
 }
 
 /**
@@ -41,35 +43,64 @@ export class DiscoveryFlowService {
 
   async run(intent: StructuredIntent, intentId: string): Promise<DiscoveryFlowResult> {
     const { discovery, policyEngine, ai, evidence, persistEvaluation } = this.deps;
+    const userId = this.deps.userId ?? null;
+
+    if (intent.isCompound) {
+      await evidence.record({
+        eventType: 'DECISION_GENERATED',
+        actor: 'agent',
+        source: 'policy_engine',
+        intentId,
+        data: { decision: 'DENY', reason: 'COMPOUND_INTENT_NOT_SUPPORTED' },
+      }, userId);
+      return {
+        intentId,
+        candidates: [],
+        allowed: [],
+        rejected: [],
+        aiRecommendation: null,
+        finalEvaluation: null,
+        selectedProduct: null,
+        decision: 'DENY',
+        confirmationRequired: false,
+        failureReason: 'COMPOUND_INTENT_NOT_SUPPORTED',
+      };
+    }
 
     const products = await discovery.search(intent);
 
     const candidates: CandidateEvaluation[] = [];
     for (const product of products) {
-      evidence.record({
-        eventType: 'PRODUCT_CONSIDERED',
-        actor: 'agent',
-        source: product.source === 'channel3' ? 'channel3' : 'demo_catalog',
-        intentId,
-        data: { productId: product.id, name: product.name, price: product.price, brand: product.brand },
-      });
+      await evidence.record(
+        {
+          eventType: 'PRODUCT_CONSIDERED',
+          actor: 'agent',
+          source: product.source === 'channel3' ? 'channel3' : 'demo_catalog',
+          intentId,
+          data: { productId: product.id, name: product.name, price: product.price, brand: product.brand },
+        },
+        userId,
+      );
 
       const evaluation = policyEngine.evaluate(intent, product);
       evaluation.intentId = intentId;
-      persistEvaluation?.(evaluation);
-      evidence.record({
-        eventType: 'POLICY_EVALUATED',
-        actor: 'policy_engine',
-        source: 'policy_engine',
-        intentId,
-        policyEvaluationId: evaluation.id,
-        data: {
-          productId: product.id,
-          result: evaluation.result,
-          confirmationRequired: evaluation.confirmationRequired,
-          ruleResults: evaluation.ruleResults,
+      await persistEvaluation?.(evaluation);
+      await evidence.record(
+        {
+          eventType: 'POLICY_EVALUATED',
+          actor: 'policy_engine',
+          source: 'policy_engine',
+          intentId,
+          policyEvaluationId: evaluation.id,
+          data: {
+            productId: product.id,
+            result: evaluation.result,
+            confirmationRequired: evaluation.confirmationRequired,
+            ruleResults: evaluation.ruleResults,
+          },
         },
-      });
+        userId,
+      );
       candidates.push({ product, evaluation });
     }
 
@@ -79,13 +110,19 @@ export class DiscoveryFlowService {
     const base = { intentId, candidates, allowed, rejected };
 
     if (allowed.length === 0) {
-      evidence.record({
-        eventType: 'DECISION_GENERATED',
-        actor: 'agent',
-        source: 'demo_catalog',
-        intentId,
-        data: { decision: 'DENY', reason: 'NO_ALLOWED_CANDIDATES' },
-      });
+      await evidence.record(
+        {
+          eventType: 'DECISION_GENERATED',
+          actor: 'agent',
+          // Provenance follows the actual discovery source (never a hard-coded
+          // demo_catalog label). Falls back to policy_engine when discovery
+          // returned no candidates at all.
+          source: candidates[0]?.product.source ?? 'policy_engine',
+          intentId,
+          data: { decision: 'DENY', reason: 'NO_ALLOWED_CANDIDATES' },
+        },
+        userId,
+      );
       return {
         ...base,
         aiRecommendation: null,
@@ -113,13 +150,16 @@ export class DiscoveryFlowService {
       recommendation = await ai.recommendProduct(intent, allowedCandidates);
     } catch (err) {
       const reason = err instanceof Error ? err.message : 'AI recommendation failed';
-      evidence.record({
-        eventType: 'DECISION_GENERATED',
-        actor: 'llm',
-        source: 'openrouter',
-        intentId,
-        data: { decision: 'DENY', reason },
-      });
+      await evidence.record(
+        {
+          eventType: 'DECISION_GENERATED',
+          actor: 'llm',
+          source: 'openrouter',
+          intentId,
+          data: { decision: 'DENY', reason },
+        },
+        userId,
+      );
       return {
         ...base,
         aiRecommendation: null,
@@ -134,13 +174,16 @@ export class DiscoveryFlowService {
     const selected = allowed.find((c) => c.product.id === recommendation.productId);
     if (!selected) {
       // Fail closed: unknown or non-allowed ID from the AI.
-      evidence.record({
-        eventType: 'DECISION_GENERATED',
-        actor: 'llm',
-        source: 'openrouter',
-        intentId,
-        data: { decision: 'DENY', reason: `UNKNOWN_PRODUCT_ID: ${recommendation.productId}` },
-      });
+      await evidence.record(
+        {
+          eventType: 'DECISION_GENERATED',
+          actor: 'llm',
+          source: 'openrouter',
+          intentId,
+          data: { decision: 'DENY', reason: `UNKNOWN_PRODUCT_ID: ${recommendation.productId}` },
+        },
+        userId,
+      );
       return {
         ...base,
         aiRecommendation: { productId: recommendation.productId, model: recommendation.model },
@@ -155,31 +198,37 @@ export class DiscoveryFlowService {
     // MANDATORY second policy check on the exact selected product.
     const finalEvaluation = policyEngine.evaluate(intent, selected.product);
     finalEvaluation.intentId = intentId;
-    persistEvaluation?.(finalEvaluation);
-    evidence.record({
-      eventType: 'POLICY_EVALUATED',
-      actor: 'policy_engine',
-      source: 'policy_engine',
-      intentId,
-      policyEvaluationId: finalEvaluation.id,
-      data: {
-        productId: selected.product.id,
-        result: finalEvaluation.result,
-        confirmationRequired: finalEvaluation.confirmationRequired,
-        ruleResults: finalEvaluation.ruleResults,
-        phase: 'post_recommendation',
-      },
-    });
-
-    if (finalEvaluation.result === 'DENY') {
-      evidence.record({
-        eventType: 'DECISION_GENERATED',
-        actor: 'agent',
+    await persistEvaluation?.(finalEvaluation);
+    await evidence.record(
+      {
+        eventType: 'POLICY_EVALUATED',
+        actor: 'policy_engine',
         source: 'policy_engine',
         intentId,
         policyEvaluationId: finalEvaluation.id,
-        data: { decision: 'DENY', productId: selected.product.id },
-      });
+        data: {
+          productId: selected.product.id,
+          result: finalEvaluation.result,
+          confirmationRequired: finalEvaluation.confirmationRequired,
+          ruleResults: finalEvaluation.ruleResults,
+          phase: 'post_recommendation',
+        },
+      },
+      userId,
+    );
+
+    if (finalEvaluation.result === 'DENY') {
+      await evidence.record(
+        {
+          eventType: 'DECISION_GENERATED',
+          actor: 'agent',
+          source: 'policy_engine',
+          intentId,
+          policyEvaluationId: finalEvaluation.id,
+          data: { decision: 'DENY', productId: selected.product.id },
+        },
+        userId,
+      );
       return {
         ...base,
         aiRecommendation: { productId: recommendation.productId, model: recommendation.model },
@@ -191,22 +240,9 @@ export class DiscoveryFlowService {
       };
     }
 
-    evidence.record({
-      eventType: 'PRODUCT_SELECTED',
-      actor: 'agent',
-      source: selected.product.source === 'channel3' ? 'channel3' : 'demo_catalog',
-      intentId,
-      policyEvaluationId: finalEvaluation.id,
-      data: {
-        productId: selected.product.id,
-        productName: selected.product.name,
-        price: selected.product.price,
-        currency: selected.product.currency,
-        model: recommendation.model,
-        confirmationRequired: finalEvaluation.confirmationRequired,
-      },
-    });
-
+    // PRODUCT_SELECTED is emitted only by the explicit selection route after the
+    // server confirms a real user selection. An AI recommendation or discovery
+    // fallback must never produce a user-selection evidence event.
     return {
       ...base,
       aiRecommendation: { productId: recommendation.productId, model: recommendation.model },
