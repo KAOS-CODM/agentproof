@@ -1,23 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import initSqlJs from 'sql.js';
-import type { EvidenceRecord, StructuredIntent } from '@agentproof/shared';
+import type { Product, StructuredIntent } from '@agentproof/shared';
 import { DiscoveryFlowService } from './DiscoveryFlowService.js';
 import { DemoCatalogService, DEMO_PRODUCTS } from './DemoCatalogService.js';
-import { ProductDiscoveryService } from './ProductDiscoveryService.js';
+import { ProductDiscoveryService, type ProductSource } from './ProductDiscoveryService.js';
 import { Channel3Service, Channel3NotConfiguredError } from './Channel3Service.js';
 import { PolicyEngine } from '../policy/PolicyEngine.js';
 import { EvidenceService } from '../evidence/EvidenceService.js';
-import type { EvidenceRepository } from '../evidence/EvidenceRepository.js';
+import { InMemoryEvidenceRepository } from '../../test/inMemoryRepositories.js';
 import type { RecommendableAIService } from '../ai/AIService.js';
-
-class InMemoryEvidenceRepository implements EvidenceRepository {
-  records: EvidenceRecord[] = [];
-  append(r: EvidenceRecord) { this.records.push(r); }
-  getById(id: string) { return this.records.find((r) => r.id === id) ?? null; }
-  getByIntentId(intentId: string) { return this.records.filter((r) => r.intentId === intentId); }
-  getByTransactionId(txId: string) { return this.records.filter((r) => r.transactionId === txId); }
-  getAll() { return [...this.records]; }
-}
 
 function makeIntent(overrides: Partial<StructuredIntent> = {}): StructuredIntent {
   return {
@@ -209,7 +199,7 @@ describe('DiscoveryFlowService', () => {
   it('O. evidence records contain correct provenance', async () => {
     const repo = new InMemoryEvidenceRepository();
     await makeFlow(pickFirstAllowed, new EvidenceService(repo)).run(makeIntent(), 'i1');
-    const records = repo.getAll();
+    const records = repo.records;
     const considered = records.filter((r) => r.eventType === 'PRODUCT_CONSIDERED');
     expect(considered.length).toBeGreaterThan(0);
     for (const r of considered) {
@@ -221,12 +211,9 @@ describe('DiscoveryFlowService', () => {
       expect(r.metadata.source).toBe('policy_engine');
       expect(r.actor).toBe('policy_engine');
     }
-    const selected = records.filter((r) => r.eventType === 'PRODUCT_SELECTED');
-    expect(selected.length).toBe(1);
-    expect(selected[0].metadata.source).toBe('demo_catalog');
-    expect(selected[0].data.model).toBe('test-model');
-    expect(selected[0].data.productId).toBeDefined();
-    expect(selected[0].policyEvaluationId).not.toBeNull();
+    // Discovery recommends a product but must not record a user-selection
+    // event: PRODUCT_SELECTED belongs exclusively to the explicit selection route.
+    expect(records.filter((r) => r.eventType === 'PRODUCT_SELECTED')).toHaveLength(0);
     // No secrets
     expect(JSON.stringify(records)).not.toContain('OPENROUTER_API_KEY');
   });
@@ -249,7 +236,7 @@ describe('DiscoveryFlowService', () => {
     expect(result.selectedProduct).not.toBeNull();
     // $99 → below $100 threshold → no confirmation
     expect(result.confirmationRequired).toBe(false);
-    expect(repo.getByIntentId('intent-e2e').length).toBeGreaterThan(0);
+    expect(repo.records.filter((r) => r.intentId === 'intent-e2e').length).toBeGreaterThan(0);
   });
 
   it('E2E failure: AI attempts invalid candidate → fails closed', async () => {
@@ -260,5 +247,158 @@ describe('DiscoveryFlowService', () => {
     expect(result.decision).toBe('DENY');
     expect(result.selectedProduct).toBeNull();
     expect(result.finalEvaluation).toBeNull();
+  });
+
+  it('compound intent (shoes and watch) returns COMPOUND_INTENT_NOT_SUPPORTED', async () => {
+    const repo = new InMemoryEvidenceRepository();
+    const result = await makeFlow(pickFirstAllowed, new EvidenceService(repo)).run(
+      makeIntent({ purpose: 'shoes and watch', isCompound: true }),
+      'intent-compound',
+    );
+    expect(result.decision).toBe('DENY');
+    expect(result.failureReason).toBe('COMPOUND_INTENT_NOT_SUPPORTED');
+    expect(result.candidates).toHaveLength(0);
+    expect(result.allowed).toHaveLength(0);
+    expect(result.selectedProduct).toBeNull();
+    const decision = repo.records.find((r) => r.eventType === 'DECISION_GENERATED');
+    expect(decision?.data.reason).toBe('COMPOUND_INTENT_NOT_SUPPORTED');
+  });
+
+  it('single-product intent (shoes only) still works normally', async () => {
+    const repo = new InMemoryEvidenceRepository();
+    const result = await makeFlow(pickFirstAllowed, new EvidenceService(repo)).run(
+      makeIntent({ purpose: 'running shoes', isCompound: false }),
+      'intent-shoes',
+    );
+    expect(result.decision).toBe('ALLOW');
+    expect(result.allowed.length).toBeGreaterThanOrEqual(2);
+    expect(result.selectedProduct).not.toBeNull();
+  });
+
+  it('single-product intent (watch only) still works normally', async () => {
+    const repo = new InMemoryEvidenceRepository();
+    const result = await makeFlow(pickFirstAllowed, new EvidenceService(repo)).run(
+      makeIntent({ purpose: 'watch', isCompound: false, maxAmount: 500, brands: [], condition: 'any' }),
+      'intent-watch',
+    );
+    expect(result.decision).toBe('ALLOW');
+    const watch = result.allowed.find((a) => a.product.id === 'demo-samsung-watch-249');
+    expect(watch).toBeDefined();
+  });
+});
+
+// ── Channel3 discovery integration ──────────────────────────────────────────
+
+function channel3Product(overrides: Partial<Product> = {}): Product {
+  return {
+    id: 'channel3:runfalcon',
+    source: 'channel3',
+    name: 'Runfalcon 3.0 Running Shoes',
+    description: 'Lightweight running shoes.',
+    price: 99,
+    currency: 'USD',
+    brand: 'Nike',
+    condition: 'new',
+    category: 'Running Shoes',
+    merchant: 'shoebacca.com',
+    ...overrides,
+  };
+}
+
+function makeChannel3Flow(
+  source: ProductSource,
+  ai: RecommendableAIService,
+  evidence: EvidenceService,
+): DiscoveryFlowService {
+  return new DiscoveryFlowService({
+    discovery: new ProductDiscoveryService(source),
+    policyEngine: new PolicyEngine(),
+    ai,
+    evidence,
+  });
+}
+
+describe('DiscoveryFlowService with real (Channel3-shaped) discovery', () => {
+  it('flows Channel3 products through policy and labels evidence as channel3', async () => {
+    const repo = new InMemoryEvidenceRepository();
+    const source: ProductSource = { search: async () => [channel3Product()] };
+
+    const result = await makeChannel3Flow(source, pickFirstAllowed, new EvidenceService(repo)).run(
+      makeIntent(),
+      'intent-c3',
+    );
+
+    expect(result.decision).toBe('ALLOW');
+    expect(result.selectedProduct?.source).toBe('channel3');
+
+    const records = repo.records;
+    const considered = records.filter((r) => r.eventType === 'PRODUCT_CONSIDERED');
+    expect(considered).toHaveLength(1);
+    expect(considered[0].metadata.source).toBe('channel3');
+
+    // A Channel3 recommendation is not a user selection, even when it flows
+    // through policy and becomes the recommended product.
+    expect(records.filter((r) => r.eventType === 'PRODUCT_SELECTED')).toHaveLength(0);
+  });
+
+  it('fails closed on an unknown condition for a new-only intent', async () => {
+    const repo = new InMemoryEvidenceRepository();
+    const source: ProductSource = { search: async () => [channel3Product({ condition: 'unknown' })] };
+
+    const result = await makeChannel3Flow(source, pickFirstAllowed, new EvidenceService(repo)).run(
+      makeIntent({ condition: 'new' }),
+      'intent-c3-unknown',
+    );
+
+    expect(result.decision).toBe('DENY');
+    expect(result.selectedProduct).toBeNull();
+    expect(result.failureReason).toBe('NO_ALLOWED_CANDIDATES');
+    const rule = result.candidates[0].evaluation.ruleResults.find((r) => r.rule === 'CONDITION');
+    expect(rule?.reason).toBe('CONDITION_MISMATCH');
+  });
+
+  it('allows an unknown condition only when the intent is any-condition', async () => {
+    const source: ProductSource = { search: async () => [channel3Product({ condition: 'unknown' })] };
+    const result = await makeChannel3Flow(
+      source,
+      pickFirstAllowed,
+      new EvidenceService(new InMemoryEvidenceRepository()),
+    ).run(makeIntent({ condition: 'any' }), 'intent-c3-any');
+    expect(result.decision).toBe('ALLOW');
+  });
+
+  it('does not mislabel a Channel3 no-candidate decision as demo_catalog', async () => {
+    const repo = new InMemoryEvidenceRepository();
+    const source: ProductSource = { search: async () => [channel3Product({ condition: 'unknown' })] };
+    await makeChannel3Flow(source, pickFirstAllowed, new EvidenceService(repo)).run(
+      makeIntent({ condition: 'new' }),
+      'intent-c3-prov',
+    );
+    const decision = repo.records
+      .find((r) => r.eventType === 'DECISION_GENERATED' && r.data.reason === 'NO_ALLOWED_CANDIDATES');
+    expect(decision).toBeDefined();
+    expect(decision?.metadata.source).not.toBe('demo_catalog');
+    expect(decision?.metadata.source).toBe('channel3');
+  });
+
+  it('propagates a live discovery failure instead of silently falling back to demo products', async () => {
+    const repo = new InMemoryEvidenceRepository();
+    const failingSource: ProductSource = {
+      search: async () => {
+        throw new Error('Channel3 search failed with status 500.');
+      },
+    };
+
+    await expect(
+      makeChannel3Flow(failingSource, pickFirstAllowed, new EvidenceService(repo)).run(
+        makeIntent(),
+        'intent-c3-fail',
+      ),
+    ).rejects.toThrow(/status 500/);
+
+    // No demo products were considered or recorded as a fallback.
+    const considered = repo.records.filter((r) => r.eventType === 'PRODUCT_CONSIDERED');
+    expect(considered).toHaveLength(0);
+    expect(JSON.stringify(repo.records)).not.toContain('demo_');
   });
 });
