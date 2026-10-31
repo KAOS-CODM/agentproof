@@ -17,6 +17,12 @@ function okResponse() {
   return { ok: true, json: async () => ({ choices: [{ message: { content: '{}' } }] }) };
 }
 
+function fetchFailedError(cause?: Record<string, unknown>): TypeError {
+  const err = new TypeError('fetch failed');
+  if (cause) (err as { cause?: unknown }).cause = cause;
+  return err;
+}
+
 function lastRequestBody(mock: ReturnType<typeof vi.fn>): Record<string, unknown> {
   const call = mock.mock.calls[0];
   const init = call[1] as { body: string };
@@ -106,5 +112,45 @@ describe('OpenRouterClient request format', () => {
       makeClient(30_000).chatCompletion({ messages, responseFormatJson: true }),
     ).rejects.toThrow(/timed out/);
     expect(mock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('OpenRouterClient error reporting', () => {
+  it('enriches a transport failure with safe diagnostics when cause.code is present', async () => {
+    stubFetch(async () => {
+      throw fetchFailedError({ code: 'ENOTFOUND', syscall: 'getaddrinfo', hostname: 'openrouter.ai' });
+    });
+
+    const err = await makeClient().chatCompletion({ messages, responseFormatJson: true }).catch((e) => e);
+
+    // Error type and identity are preserved; only the message is enriched.
+    expect(err).toBeInstanceOf(TypeError);
+    expect(err.message).toContain('fetch failed');
+    expect(err.message).toContain('name=TypeError');
+    expect(err.message).toContain('code=ENOTFOUND');
+    expect(err.message).toContain('syscall=getaddrinfo');
+    expect(err.message).toContain('hostname=openrouter.ai');
+    expect(err.message).not.toContain('test-key');
+  });
+
+  it('preserves the base message when no cause.code is available', async () => {
+    stubFetch(async () => {
+      throw fetchFailedError();
+    });
+
+    const err = await makeClient().chatCompletion({ messages, responseFormatJson: true }).catch((e) => e);
+
+    expect(err).toBeInstanceOf(TypeError);
+    expect(err.message).toContain('fetch failed');
+    expect(err.message).toContain('name=TypeError');
+    expect(err.message).not.toContain('code=');
+  });
+
+  it('still reports HTTP/provider rejections with their status (not as transport errors)', async () => {
+    stubFetch(async () => ({ ok: false, status: 429, text: async () => 'rate limited' }));
+
+    await expect(
+      makeClient().chatCompletion({ messages, responseFormatJson: true }),
+    ).rejects.toThrow('OpenRouter request failed with status 429');
   });
 });

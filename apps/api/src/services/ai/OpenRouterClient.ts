@@ -1,4 +1,5 @@
 import { config } from '../../config/env.js';
+import { formatTransportDiagnostic } from '../../utils/transportDiagnostics.js';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -113,6 +114,14 @@ export class OpenRouterClient {
     } catch (err) {
       if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
         throw new Error(`OpenRouter request timed out after ${this.timeoutMs}ms`);
+      }
+      // Diagnostic-only: enrich the original error message with safe transport
+      // identifiers (name, cause.code, cause.syscall, cause.hostname) while
+      // preserving the error type and stack. HTTP/provider rejections are
+      // handled by the !response.ok branch below and never reach this path.
+      if (err instanceof Error) {
+        const diagnostic = formatTransportDiagnostic(err);
+        if (diagnostic) err.message = `${err.message}${diagnostic}`;
       }
       throw err;
     }

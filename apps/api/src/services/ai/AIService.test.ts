@@ -75,4 +75,98 @@ describe('AIService.parseIntent', () => {
     const service = new AIService(new OpenRouterClient('', 'test-model'));
     await expect(service.parseIntent('x')).rejects.toThrow('OPENROUTER_API_KEY');
   });
+
+  describe('price interpretation', () => {
+    async function parseWithContent(content: string) {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => ({
+          ok: true,
+          json: async () => ({
+            model: 'test-model',
+            choices: [{ message: { content } }],
+          }),
+        })),
+      );
+      return makeService().parseIntent('test');
+    }
+
+    it('"under $150" sets maxAmount to 150 with no price constraint', async () => {
+      const result = await parseWithContent(JSON.stringify({
+        purpose: 'running shoes',
+        maxAmount: 150,
+        currency: 'USD',
+        brands: [],
+        condition: 'any',
+        requiresConfirmationAbove: null,
+        constraints: [],
+      }));
+      expect(result.structured.maxAmount).toBe(150);
+      expect(result.structured.constraints).toHaveLength(0);
+    });
+
+    it('"at least $100" uses a gte constraint, not maxAmount=100', async () => {
+      const result = await parseWithContent(JSON.stringify({
+        purpose: 'watch',
+        maxAmount: 999999,
+        currency: 'USD',
+        brands: [],
+        condition: 'any',
+        requiresConfirmationAbove: null,
+        constraints: [{ type: 'price', value: 100, operator: 'gte' }],
+      }));
+      expect(result.structured.maxAmount).toBe(999999);
+      expect(result.structured.constraints).toEqual([
+        { type: 'price', value: 100, operator: 'gte' },
+      ]);
+    });
+
+    it('"between $50 and $100" uses gte and lte constraints', async () => {
+      const result = await parseWithContent(JSON.stringify({
+        purpose: 'shoes',
+        maxAmount: 100,
+        currency: 'USD',
+        brands: [],
+        condition: 'any',
+        requiresConfirmationAbove: null,
+        constraints: [
+          { type: 'price', value: 50, operator: 'gte' },
+          { type: 'price', value: 100, operator: 'lte' },
+        ],
+      }));
+      expect(result.structured.maxAmount).toBe(100);
+      expect(result.structured.constraints).toHaveLength(2);
+      expect(result.structured.constraints[0]).toEqual({ type: 'price', value: 50, operator: 'gte' });
+      expect(result.structured.constraints[1]).toEqual({ type: 'price', value: 100, operator: 'lte' });
+    });
+
+    it('compound intent "shoes and watch" sets isCompound true', async () => {
+      const result = await parseWithContent(JSON.stringify({
+        purpose: 'shoes and watch',
+        isCompound: true,
+        maxAmount: 999999,
+        currency: 'USD',
+        brands: [],
+        condition: 'any',
+        requiresConfirmationAbove: null,
+        constraints: [{ type: 'price', value: 100, operator: 'gte' }],
+      }));
+      expect(result.structured.isCompound).toBe(true);
+      expect(result.structured.constraints).toEqual([{ type: 'price', value: 100, operator: 'gte' }]);
+    });
+
+    it('single-product intent has isCompound false or undefined', async () => {
+      const result = await parseWithContent(JSON.stringify({
+        purpose: 'running shoes',
+        isCompound: false,
+        maxAmount: 150,
+        currency: 'USD',
+        brands: [],
+        condition: 'any',
+        requiresConfirmationAbove: null,
+        constraints: [],
+      }));
+      expect(result.structured.isCompound ?? false).toBe(false);
+    });
+  });
 });
