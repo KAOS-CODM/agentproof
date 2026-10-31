@@ -9,3 +9,14 @@ dist/
 
 .env.*
 !.env.example
+.playwright-mcp/
+# Test coverage and output artifacts
+coverage/
+.nyc_output/
+.vitest/
+# Generated MongoDB DNS diagnostic reports
+MONGODB-DNS-*.md
+
+PHASE_2_COMPLETION.txt
+
+DATABASE_AUDIT_REPORT.txt
