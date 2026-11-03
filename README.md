@@ -45,65 +45,22 @@ AI agents can propose financial actions without guardrails, leading to unconstra
 
 ---
 
-## Application Workflow
-
-The typical operator-plus-user journey:
-
-1. **Account provisioning** — The operator sets `AUTH_INITIAL_EMAIL` and `AUTH_INITIAL_PASSWORD` in `.env`; `initDb()` creates the account once at startup. There is no public registration route.
-
-2. **Sign in** — The operator-signed-in user visits the app, the app reads the `agentproof_session` HttpOnly cookie, and grants access.
-
-3. **Create intent** — The user submits a free-form request (e.g., "Buy me running shoes under $150, new only"). The app sends it to `POST /api/v1/intent`, which:
-   - Forwards the raw text to OpenRouter LLM for parsing into a structured intent
-   - Persists the intent owned by the authenticated user with status VALIDATED
-   - Returns the intent ID, routing the user to the discovery stage
-
-4. **Product discovery** — The user clicks **Find matching products**, which calls `POST /api/v1/products/discover`. The server:
-   - Retrieves the user's persisted structured intent
-   - Runs the DiscoveryFlowService: policy engine evaluates each candidate product
-   - Only ALLOW-listed products are stored as server-side snapshots (never client-supplied data)
-   - Persists per-intent discovery associations so one intent's offers never overwrite another's
-   - Returns the decision (ALLOW/DENY), allowed/rejected candidates, and freshness info
-
-5. **Select product** — The user clicks **Select** on an ALLOW candidate. The server:
-   - Binds the selection to the exact immutable offer snapshot (price, currency, merchant snapshotted at discovery time)
-   - Enforces freshness window — stale snapshots are rejected
-   - Records PRODUCT_SELECTED evidence, bound to the selection row
-   - Returns the confirmed selection; the user can now proceed to payment
-
-6. **PayPal order creation** — The user clicks **Buy with PayPal**. The server:
-   - Re-evaluates policy against the persisted selection snapshot
-   - If confirmation is required (price above threshold), returns CONFIRMATION_REQUIRED
-   - If policy DENIED, returns 422 with evaluation details
-   - If authorized, creates a PayPal Sandbox order
-   - Persists a PAYMENT_PENDING transaction row (never PAYMENT_COMPLETED until capture)
-   - Returns the order ID, approval URL, and policy evaluation
-
-7. **PayPal approval** — The browser loads the PayPal SDK and the user approves the order in PayPal Sandbox.
-
-8. **PayPal capture** — The user (or flow) completes capture. The server:
-   - Verifies the captured order matches the transaction (amount, currency, invoice ID)
-   - If verified, transitions the transaction to PAYMENT_COMPLETED
-   - Records PAYPAL_PAYMENT_CAPTURED and PAYMENT_CAPTURED evidence events
-   - If evidence persistence fails, reports PAYMENT_COMPLETED with evidenceIncomplete flag and RECOVERY_PENDING status
-   - Returns the capture result with financialState
-
-9. **Evidence and history** — The user views the evidence timeline and saved workflow. The persisted transaction (not the transient PayPal response) is the source of truth for display. Completion evidence status is shown explicitly, with a reconcile action if evidence is incomplete.
-
-10. **Browser refresh** — The user's hash route (`#/?intent=<id>`) rehydrates the full workflow from the server: intent, discoveries, policy evaluations, latest transaction, and evidence. No re-discovery or stale client state is trusted.
-
----
-
 ## Authentication and User Management
 
-- **Operator-provisioned accounts only** — `AUTH_INITIAL_EMAIL` and `AUTH_INITIAL_PASSWORD` in `.env`; no registration, reset, or password-change flow exists. Accounts are created once at startup via `provisionInitialAuth()`.
-- **HttpOnly session cookie** — `agentproof_session`, configured with `SameSite`, `Path=/`, and `Secure` controlled by `AUTH_COOKIE_SECURE`. The SameSite attribute defaults to `'strict'` for development localhost compatibility; production operators set `AUTH_COOKIE_SAMESITE=none` (must accompany `AUTH_COOKIE_SECURE=true` for cross-site cookie support, e.g., on Render).
-- **Session validation on each protected route** — token hash looked up in repository; active lookup enforces `expiresAt` and `revokedAt`.
-- **No browser storage for tokens** — cookies only; `credentials: 'include'` on all API requests.
-- **401 → sign-in screen** — expired or revoked session returns the user to the sign-in screen.
-- **Login and registration** both set the session cookie with matching attributes (HttpOnly, SameSite, Path, Secure).
+* **User registration and sign-in**: AgentProof provides a registration flow for creating user accounts and a login flow for existing users.
+* **Initial account provisioning**: `AUTH_INITIAL_EMAIL` and `AUTH_INITIAL_PASSWORD` configure the initial account through `provisionInitialAuth()`. This is initial account provisioning, not the application's only account-creation mechanism.
+* **HttpOnly session cookie**: Authentication uses the `agentproof_session` cookie, configured with `SameSite`, `Path=/`, and `Secure` controlled by `AUTH_COOKIE_SECURE`.
+* **Cross-site cookie configuration**: `SameSite` defaults to `strict`. Production deployments requiring cross-site cookies can set `AUTH_COOKIE_SAMESITE=none`, accompanied by `AUTH_COOKIE_SECURE=true`.
+* **Consistent registration and login sessions**: Both registration and login establish sessions using matching cookie attributes.
+* **Session validation**: Protected routes validate sessions against the stored token hash. Active session lookup enforces `expiresAt` and `revokedAt`.
+* **No browser token storage**: Session tokens are maintained through HttpOnly cookies rather than browser-accessible storage. API requests include `credentials: 'include'`.
+* **Session expiry and revocation**: Invalid, expired, or revoked sessions result in an unauthenticated response, returning the user to the sign-in screen.
 
-Every repository query is scoped to the authenticated userId from the session, never from client input. Unknown IDs and other users' IDs both return 404 — no existence leak. Client-supplied `userId` fields are ignored; intent context resolves from the persisted, owned intent.
+### User Data Isolation
+
+Every repository query is scoped to the authenticated user's `userId` obtained from the session, never from client input.
+
+Unknown resource IDs and resources belonging to other users both return `404`, preventing resource-existence disclosure. Client-supplied `userId` fields are ignored, and intent context is resolved from the persisted intent owned by the authenticated user.
 
 ---
 
@@ -181,7 +138,7 @@ The Policy Engine — not the LLM — is the sole authority for ALLOW/DENY decis
 4. If DENIED → returns 422 with evaluation details
 5. If authorized → OrderCreationService creates PayPal Sandbox order
 6. Persists a `PAYMENT_PENDING` transaction row (never `PAYMENT_COMPLETED` until capture)
-7. Returns transactionId, financialState, paypal orderId, approvalUrl, evaluation, confirmationRequired
+7. Returns: `transactionId`, `financialState: PAYMENT_PENDING`, `paypal: { orderId, status, approveUrl }`, `evaluation`, `confirmationRequired`
 
 ---
 
@@ -235,12 +192,11 @@ This implementation supports PayPal Sandbox only. Live PayPal processing is not 
 2. Server verifies the captured order matches the transaction:
    - Amount must match
    - Currency must match
-   - Invoice ID must match the original PayPal order ID
+   - Invoice ID must match the original order ID
 3. If verified → transitions transaction to `PAYMENT_COMPLETED`
-4. If mismatched → returns 409 `MISMATCHED_ORDER` or 409 `INVALID_ORDER_STATE`
-5. Records evidence events: `PAYPAL_PAYMENT_CAPTURED`, `PAYMENT_CAPTURED`
-6. If evidence persistence fails → returns `PAYMENT_COMPLETED` with `evidenceIncomplete: true` and `evidenceStatus: 'RECOVERY_PENDING'`
-7. Returns: `transactionId`, `financialState`, `reconciled`, `evidenceIncomplete`/`evidenceStatus`, paypal details (orderId, captureId, amount, currency, orderStatus, captureStatus)
+4. Records evidence events: `PAYPAL_PAYMENT_CAPTURED`, `PAYMENT_CAPTURED`
+5. If evidence persistence fails → returns `PAYMENT_COMPLETED` with `evidenceIncomplete: true` and `evidenceStatus: 'RECOVERY_PENDING'`
+6. Returns: `transactionId`, `financialState`, `reconciled`, `evidenceIncomplete`/`evidenceStatus`, paypal details (orderId, captureId, amount, currency, orderStatus, captureStatus)
 
 **Critical distinction**: Order creation ≠ payment completed. Capture verification is required before the financial state transitions to COMPLETED.
 
@@ -393,8 +349,6 @@ agentproof/
 ---
 
 ## Environment Configuration
-
-Every relevant configuration variable:
 
 ### Frontend Build-Time Variables (exposed to browser)
 
