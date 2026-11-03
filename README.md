@@ -22,7 +22,8 @@ The following features are implemented and verified by the test suite:
 - **PayPal Sandbox order creation, capture verification, and idempotent retry**
 - **Append-only, owner-scoped evidence ledger** with bounded completion-evidence recovery
 - **SQLite by default and MongoDB Atlas explicitly opt-in**, with no silent fallback
-- **Operator-provisioned accounts**, HttpOnly server-side sessions, CSRF/CORS checks
+- **Public user registration and sign-in**, operator-provisioned initial accounts via `AUTH_INITIAL_EMAIL` and `AUTH_INITIAL_PASSWORD`
+- **HttpOnly server-side sessions**, CSRF/CORS checks
 - **Persisted per-user workflow, transaction, discovery, and evidence history**
 - **Responsive React UI** for the full workflow, including loading/empty/error states
 - **Unit, repository-contract, API, and frontend tests**
@@ -45,16 +46,59 @@ AI agents can propose financial actions without guardrails, leading to unconstra
 
 ---
 
+## Two Separate Financial Flows
+
+AgentProof currently has **two separate financial flows** that must not be conflated:
+
+### A. Channel3 Product Discovery and Retailer Handoff
+
+Channel3 is used for **product discovery only**. The flow is:
+
+1. User submits a free-form request → `POST /api/v1/intent` → OpenRouter LLM parsing → intent persisted
+2. User clicks **Find matching products** → `POST /api/v1/products/discover` → DiscoveryFlowService runs policy engine evaluation
+3. Only ALLOW-listed products are stored as server-side offer snapshots (never client-supplied data)
+4. Per-intent discovery associations isolate one intent's offers from another's
+5. User clicks **Select** on an ALLOW candidate → `POST /api/v1/selections` → binds to immutable snapshot → PRODUCT_SELECTED evidence recorded
+6. User clicks **Retailer Handoff** → `POST /api/v1/products/handoff` → server returns a URL bound to the exact offer snapshot
+7. **Browser navigates to the returned URL** — the purchase happens outside AgentProof; the app records no purchase claim and does not intercept the redirect
+
+**Channel3 provides product discovery and server-verified handoff URLs only. Integrated checkout is not implemented.** The actual retailer checkout and purchase happen outside AgentProof. AgentProof does not receive retailer checkout confirmation, process the retailer's order, or verify retailer fulfillment through Channel3.
+
+### B. PayPal Sandbox Payment Flow
+
+PayPal is integrated as a **separate payment workflow**. The flow is:
+
+1. User clicks **Buy with PayPal** → `POST /api/v1/payments/create-order` → policy re-evaluation against persisted selection snapshot
+2. If confirmation required → returns 409 with `confirmationRequired: true`
+3. If policy DENIED → returns 422 with evaluation details
+4. If authorized → OrderCreationService creates PayPal Sandbox order
+5. Persists a `PAYMENT_PENDING` transaction row (never `PAYMENT_COMPLETED` until capture)
+6. Returns: `transactionId`, `financialState: PAYMENT_PENDING`, `paypal: { orderId, status, approveUrl }`, `evaluation`, `confirmationRequired`
+7. **User approves the order in PayPal Sandbox** — browser loads PayPal SDK with `VITE_PAYPAL_CLIENT_ID`
+8. **PayPal capture** → `POST /api/v1/payments/capture` → server verifies the captured order matches the transaction (amount, currency, invoice ID)
+9. If verified → transitions the transaction to `PAYMENT_COMPLETED`
+10. Records evidence events: `PAYPAL_PAYMENT_CAPTURED` and `PAYMENT_CAPTURED`
+11. If evidence persistence fails → returns `PAYMENT_COMPLETED` with `evidenceIncomplete: true` and `evidenceStatus: 'RECOVERY_PENDING'`
+
+**CRITICAL DISTINCTIONS:**
+
+- **PayPal order creation ≠ payment completed.** An order being created does not mean payment was completed.
+- **PayPal approval ≠ capture.** User approval in the PayPal SDK does not by itself mean the payment was captured.
+- **Capture verification is required** before any state transition to `PAYMENT_COMPLETED`. The amount, currency, and invoice ID must match the original order.
+- **A successful PayPal Sandbox capture confirms the PayPal transaction, not a purchase from the external retailer.** The two flows must not be presented as a unified checkout or an end-to-end retailer purchase.
+
+---
+
 ## Authentication and User Management
 
-* **User registration and sign-in**: AgentProof provides a registration flow for creating user accounts and a login flow for existing users.
-* **Initial account provisioning**: `AUTH_INITIAL_EMAIL` and `AUTH_INITIAL_PASSWORD` configure the initial account through `provisionInitialAuth()`. This is initial account provisioning, not the application's only account-creation mechanism.
-* **HttpOnly session cookie**: Authentication uses the `agentproof_session` cookie, configured with `SameSite`, `Path=/`, and `Secure` controlled by `AUTH_COOKIE_SECURE`.
-* **Cross-site cookie configuration**: `SameSite` defaults to `strict`. Production deployments requiring cross-site cookies can set `AUTH_COOKIE_SAMESITE=none`, accompanied by `AUTH_COOKIE_SECURE=true`.
-* **Consistent registration and login sessions**: Both registration and login establish sessions using matching cookie attributes.
-* **Session validation**: Protected routes validate sessions against the stored token hash. Active session lookup enforces `expiresAt` and `revokedAt`.
-* **No browser token storage**: Session tokens are maintained through HttpOnly cookies rather than browser-accessible storage. API requests include `credentials: 'include'`.
-* **Session expiry and revocation**: Invalid, expired, or revoked sessions result in an unauthenticated response, returning the user to the sign-in screen.
+- **User registration and sign-in**: AgentProof provides a registration flow for creating user accounts (`POST /api/v1/auth/register`) and a login flow for existing users.
+- **Initial account provisioning**: `AUTH_INITIAL_EMAIL` and `AUTH_INITIAL_PASSWORD` configure the initial account through `provisionInitialAuth()`. This is initial account provisioning, not the application's only account-creation mechanism.
+- **HttpOnly session cookie**: Authentication uses the `agentproof_session` cookie, configured with `SameSite`, `Path=/`, and `Secure` controlled by `AUTH_COOKIE_SECURE`.
+- **Cross-site cookie configuration**: `SameSite` defaults to `strict`. Production deployments requiring cross-site cookies can set `AUTH_COOKIE_SAMESITE=none`, accompanied by `AUTH_COOKIE_SECURE=true`.
+- **Consistent registration and login sessions**: Both registration and login establish sessions using matching cookie attributes.
+- **Session validation**: Protected routes validate sessions against the stored token hash. Active session lookup enforces `expiresAt` and `revokedAt`.
+- **No browser token storage**: Session tokens are maintained through HttpOnly cookies rather than browser-accessible storage. API requests include `credentials: 'include'`.
+- **Session expiry and revocation**: Invalid, expired, or revoked sessions result in an unauthenticated response, returning the user to the sign-in screen.
 
 ### User Data Isolation
 
@@ -128,17 +172,7 @@ The Policy Engine — not the LLM — is the sole authority for ALLOW/DENY decis
 4. Defensive identity checks: resolved snapshot must exactly match the client's requested intent, source, and product
 5. PRODUCT_SELECTED evidence recorded, bound to the selection row
 6. Response includes `selection` (SelectionView projection) and `evidenceRecorded`/`evidenceError` (partial success: selection persisted but evidence failed is reported without rolling back the selection)
-7. The user can now proceed to payment
-
-### Order Creation
-
-1. User clicks **Buy with PayPal** → `POST /api/v1/payments/create-order`
-2. Server re-evaluates policy against the persisted selection snapshot
-3. If CONFIRMATION_REQUIRED → returns 409 with `confirmationRequired: true`
-4. If DENIED → returns 422 with evaluation details
-5. If authorized → OrderCreationService creates PayPal Sandbox order
-6. Persists a `PAYMENT_PENDING` transaction row (never `PAYMENT_COMPLETED` until capture)
-7. Returns: `transactionId`, `financialState: PAYMENT_PENDING`, `paypal: { orderId, status, approveUrl }`, `evaluation`, `confirmationRequired`
+7. The user can now proceed to either payment or retailer handoff
 
 ---
 
@@ -159,9 +193,11 @@ The retailer handoff endpoint returns a server-verified URL bound to the exact o
 **What it does not do:**
 
 - Opening this URL completes the purchase outside AgentProof; the app records no purchase claim and does not intercept the redirect.
-- Integrated checkout is not implemented — Channel3 provides product discovery and server-verified handoff URLs only; purchases are completed outside AgentProof.
+- **Integrated checkout is not implemented** — Channel3 provides product discovery and server-verified handoff URLs only; purchases are completed outside AgentProof.
 
 The browser explicitly navigates to the returned URL (`window.location.assign(result.url)`). After navigation, AgentProof has no control over the external retailer experience.
+
+**This handoff flow is separate from the PayPal payment flow.** A Channel3 retailer handoff does not create a PayPal order, and a PayPal order is not for a Channel3 retailer purchase.
 
 ---
 
@@ -193,12 +229,17 @@ This implementation supports PayPal Sandbox only. Live PayPal processing is not 
    - Amount must match
    - Currency must match
    - Invoice ID must match the original order ID
-3. If verified → transitions transaction to `PAYMENT_COMPLETED`
-4. Records evidence events: `PAYPAL_PAYMENT_CAPTURED`, `PAYMENT_CAPTURED`
+3. If verified → transitions the transaction to `PAYMENT_COMPLETED`
+4. Records evidence events: `PAYPAL_PAYMENT_CAPTURED` and `PAYMENT_CAPTURED`
 5. If evidence persistence fails → returns `PAYMENT_COMPLETED` with `evidenceIncomplete: true` and `evidenceStatus: 'RECOVERY_PENDING'`
 6. Returns: `transactionId`, `financialState`, `reconciled`, `evidenceIncomplete`/`evidenceStatus`, paypal details (orderId, captureId, amount, currency, orderStatus, captureStatus)
 
-**Critical distinction**: Order creation ≠ payment completed. Capture verification is required before the financial state transitions to COMPLETED.
+**Critical distinctions:**
+
+- **Order creation ≠ payment completed.** An order being created does not mean payment was completed.
+- **User approval ≠ capture.** User approval in the PayPal SDK does not by itself mean the payment was captured.
+- **Capture verification is required** before the financial state transitions to `PAYMENT_COMPLETED`.
+- **A successful PayPal Sandbox capture confirms the PayPal transaction, not a purchase from the external retailer.** Do not represent PayPal capture as proof that an external retailer order was fulfilled.
 
 ### Idempotency
 
@@ -236,7 +277,7 @@ This implementation supports PayPal Sandbox only. Live PayPal processing is not 
 - `GET /api/v1/evidence?intentId=<id>` — filters by intent
 - `GET /api/v1/evidence?transactionId=<id>` — filters by transaction
 - Single record: `GET /api/v1/evidence/:id`
-- Evidence record types: PRODUCT_SELECTED, POLICY_EVALUATED, PAYPAL_PAYMENT_CAPTURED, PAYMENT_CAPTURED, EVIDENCE_RECOVERED
+- Evidence record types: PRODUCT_SELECTED, POLICY_EVALUATED, PAYPAL_ORDER_CREATED, PAYPAL_ORDER_APPROVAL_VERIFIED, PAYPAL_PAYMENT_CAPTURED, PAYMENT_CAPTURED, PAYMENT_COMPLETED
 
 ### Reconciliation
 
@@ -251,7 +292,7 @@ This implementation supports PayPal Sandbox only. Live PayPal processing is not 
 ### Frontend
 
 - **React 18** with Vite 5
-- Hash-routed workflow (intent → policy → product → payment → evidence)
+- Hash-routed workflow (intent → policy → product → payment/handoff → evidence)
 - Components: `LoginScreen`, `IntentInput`, `CandidateCard`, `PaymentPanel`, `EvidenceTimeline`, `WorkflowHistory`, `StructuredIntentView`, `RetailerHandoff`
 - Hooks: `useHashRoute`, `useSearchParams`
 - API client: `src/api.ts` — fetch-based with `VITE_API_URL` base and `credentials: 'include'`
@@ -539,6 +580,8 @@ This repository does not contain PayPal Sandbox credentials, and no external ser
 
 The retailer handoff endpoint returns a server-verified URL bound to the exact offer snapshot the user selected. Opening this URL completes the purchase outside AgentProof; the app records no purchase claim and does not intercept the redirect. The handoff feature is disabled by default (`RETAILER_HANDOFF_ENABLED=false`) and must be explicitly enabled by the operator with approved allowed link hosts.
 
+**This handoff is separate from the PayPal payment flow.** A Channel3 retailer handoff does not create a PayPal order, and a PayPal order is not for a Channel3 retailer purchase.
+
 ---
 
 ## Security and Trust Model
@@ -577,18 +620,18 @@ The retailer handoff endpoint returns a server-verified URL bound to the exact o
 
 ## Actual Current Limitations
 
-- **No public registration, password reset, or account management UI** — accounts are operator-provisioned only (via `AUTH_INITIAL_EMAIL` + `AUTH_INITIAL_PASSWORD` at startup)
-- **SQLite is a single-process store** — do not run multiple API processes against the same `DB_PATH`; they race on whole-file replacement
-- **PayPal completion requires operator-supplied Sandbox credentials** — no end-to-end verification without them
-- **Channel3 provides product discovery and server-verified handoff URLs only** — integrated checkout is not implemented; opening the retailer URL completes the purchase outside AgentProof
-- **MongoDB Atlas requires explicit configuration and DNS fix** (Windows: `dns.setServers(['8.8.8.8'])` at startup)
-- **No background reconciliation worker** — completed-transaction evidence is reconciled on the next capture retry or explicit action
-- **Prices and availability are snapshotted at discovery time** — re-discovery required for current data
-- **Compound intents (multiple product categories)** are not supported — each request must request one product category
-- **No session cleanup job for SQLite** — expired rows are ignored by active lookup but not physically deleted
-- **Legacy ownerless data** (pre-P5) is intentionally hidden from normal users; trusted operator path required for migration
-- **No WAL or multi-writer coordination** for SQLite — one API process per `DB_PATH`
-- **AUTH_COOKIE_SAMESITE requires manual configuration** for production cross-site: set `AUTH_COOKIE_SAMESITE=none` on Render/dashboard and ensure `AUTH_COOKIE_SECURE=true` (the default in production)
+- **No password reset or account management UI** — accounts can be created via the `POST /api/v1/auth/register` registration flow, but there is no password-reset or account-management interface.
+- **SQLite is a single-process store** — do not run multiple API processes against the same `DB_PATH`; they race on whole-file replacement.
+- **PayPal completion requires operator-supplied Sandbox credentials** — no end-to-end verification without them.
+- **Channel3 provides product discovery and server-verified handoff URLs only** — integrated checkout is not implemented; opening the retailer URL completes the purchase outside AgentProof. This flow is separate from the PayPal payment flow.
+- **MongoDB Atlas requires explicit configuration and DNS fix** (Windows: `dns.setServers(['8.8.8.8'])` at startup).
+- **No background reconciliation worker** — completed-transaction evidence is reconciled on the next capture retry or explicit action.
+- **Prices and availability are snapshotted at discovery time** — re-discovery required for current data.
+- **Compound intents (multiple product categories)** are not supported — each request must request one product category.
+- **No session cleanup job for SQLite** — expired rows are ignored by active lookup but not physically deleted.
+- **Legacy ownerless data** (pre-P5) is intentionally hidden from normal users; trusted operator path required for migration.
+- **No WAL or multi-writer coordination** for SQLite — one API process per `DB_PATH`.
+- **AUTH_COOKIE_SAMESITE requires manual configuration** for production cross-site: set `AUTH_COOKIE_SAMESITE=none` on Render/dashboard and ensure `AUTH_COOKIE_SECURE=true` (the default in production).
 
 ---
 
