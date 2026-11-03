@@ -378,3 +378,17 @@ switch providers.
 ## Next Phase
 
 P6 is the current completed scope. P7 and later are not implemented.
+
+## Roadmap
+
+Planned capabilities that go beyond the current P6 scope:
+
+- **Personalised shopping preferences** — user-configurable preferences for product categories, price ranges, and brands.
+- **Daily personalised product updates** — curated product recommendations based on saved preferences and discovery history.
+- **Price and availability change notifications** — alerts when monitored products change price or become available.
+- **Trend-based discovery** — when reliable popularity data is available, feature products with rising interest.
+- **Channel3 checkout capability** — investigation of deeper Channel3 integration for completing purchases within the workflow; not currently implemented.
+- **Additional retailer integrations** — supporting outbound links to additional merchant platforms beyond Channel3.
+- **Future PayPal-connected purchasing workflows** — beyond the current Sandbox verification, exploring end-to-end PayPal-connected purchase flows that remain explicitly authorized by the user.
+
+All future roadmap items are aspirational and will be implemented only after explicit approval. None of the above should be described as completed or guaranteed functionality. Consequential financial actions must always require explicit user authorization.
