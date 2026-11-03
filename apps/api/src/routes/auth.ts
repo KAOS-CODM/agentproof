@@ -51,6 +51,7 @@ authRouter.post('/login', async (req, res) => {
     secure: config.authCookieSecure,
     maxAgeMs: sessionTtlMs,
     expiresAt: result.expiresAt,
+    sameSite: config.authCookieSameSite,
   });
   res.cookie(SESSION_COOKIE_NAME, result.token, opts as any);
   res.json({ user: result.user, expiresAt: result.expiresAt });
@@ -89,6 +90,7 @@ authRouter.post('/register', async (req, res) => {
       secure: config.authCookieSecure,
       maxAgeMs: sessionTtlMs,
       expiresAt: loginResult.expiresAt,
+      sameSite: config.authCookieSameSite,
     });
     res.cookie(SESSION_COOKIE_NAME, loginResult.token, opts as any);
     res.status(201).json({
@@ -114,7 +116,7 @@ authRouter.post('/logout', async (req, res) => {
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
     secure: config.authCookieSecure,
-    sameSite: 'strict',
+    sameSite: config.authCookieSameSite,
     path: '/',
   } as any);
   res.status(204).end();

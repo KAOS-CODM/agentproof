@@ -86,6 +86,13 @@ export const config = {
   corsOrigin: process.env.CORS_ORIGIN || null,
   authSessionTtlMs: parsePositiveInt(process.env.AUTH_SESSION_TTL_HOURS, 24) * 60 * 60 * 1000,
   authCookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, nodeEnv === 'production'),
+  // Default SameSite to 'strict' for development localhost compatibility.
+  // Production operators should set AUTH_COOKIE_SAMESITE=none (with AUTH_COOKIE_SECURE=true)
+  // via the Render dashboard or .env. An unsafe default of 'none' without Secure=true
+  // is prevented by also defaulting authCookieSameSite to 'strict' when not explicitly
+  // overridden; the explicit env var is the only path to production SameSite=None.
+  authCookieSameSite:
+    process.env.AUTH_COOKIE_SAMESITE || 'strict',
   authInitialEmail: process.env.AUTH_INITIAL_EMAIL || null,
   authInitialPassword: process.env.AUTH_INITIAL_PASSWORD || null,
 };

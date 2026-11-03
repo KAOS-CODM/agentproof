@@ -41,11 +41,11 @@ export interface SessionCookieOptions {
   expires?: Date;
 }
 
-export function buildSessionCookieOptions(params: { secure: boolean; maxAgeMs: number; expiresAt: string }): SessionCookieOptions {
+export function buildSessionCookieOptions(params: { secure: boolean; maxAgeMs: number; expiresAt: string; sameSite?: string }): SessionCookieOptions {
   return {
     httpOnly: true,
     secure: params.secure,
-    sameSite: 'strict',
+    sameSite: (params.sameSite ?? 'strict') as 'strict' | 'lax' | 'none',
     path: '/',
     // Express's res.cookie() treats maxAge as milliseconds and derives both
     // Expires and the serialized Max-Age (seconds) from it.
