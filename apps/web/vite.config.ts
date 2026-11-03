@@ -3,14 +3,14 @@ import react from '@vitejs/plugin-react';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-// The repo-root .env is the single source of truth for PayPal credentials.
-// Scripts run from apps/web, so the repo root is two directories up.
-const repoRoot = resolve(process.cwd(), '../..');
+// The repo-root .env is the single source of truth for local-development
+// fallbacks. Render injects environment variables into process.env, which takes
+// precedence so the dashboard can configure the API URL and PayPal client ID.
+const repoRoot = resolve(process.cwd(), '..');
 
-// Read exactly ONE key from the root .env without using Vite's env loading.
-// Vite's loadEnv / envDir would also load NODE_ENV=development from this file,
-// which makes every production build use the React *development* bundle
-// (VITE_USER_NODE_ENV handling). Parsing the file ourselves avoids that.
+// Check process.env first, then fall back to root .env for local development.
+// This ensures Render-declared values override the .env file, while developers
+// can still set values in .env for local runs without modifying the dashboard.
 function readEnvFile(filePath: string): Record<string, string> {
   const out: Record<string, string> = {};
   try {
@@ -28,15 +28,25 @@ function readEnvFile(filePath: string): Record<string, string> {
   return out;
 }
 
-const env = readEnvFile(resolve(repoRoot, '.env'));
+// Process env takes precedence over .env for production variables.
+// Missing values safely fall back to empty strings.
+const env = {
+  VITE_PAYPAL_CLIENT_ID:
+    process.env.VITE_PAYPAL_CLIENT_ID ||
+    readEnvFile(resolve(repoRoot, '.env')).PAYPAL_CLIENT_ID ||
+    '',
+  VITE_API_URL:
+    process.env.VITE_API_URL || readEnvFile(resolve(repoRoot, '.env')).VITE_API_URL || '',
+};
 
 export default defineConfig({
   plugins: [react()],
-  // Forward the single public client ID to the browser under the VITE_ name the
-  // frontend reads. PAYPAL_CLIENT_SECRET is never referenced and never bundled;
+  // Forward the public client ID and API URL to the browser under the VITE_ name
+  // the frontend reads. PAYPAL_CLIENT_SECRET is never referenced and never bundled;
   // Vite's envPrefix stays the default (VITE_), so nothing else from .env leaks.
   define: {
-    'import.meta.env.VITE_PAYPAL_CLIENT_ID': JSON.stringify(env.PAYPAL_CLIENT_ID || ''),
+    'import.meta.env.VITE_PAYPAL_CLIENT_ID': JSON.stringify(env.VITE_PAYPAL_CLIENT_ID),
+    'import.meta.env.VITE_API_URL': JSON.stringify(env.VITE_API_URL),
   },
   server: {
     port: 5173,

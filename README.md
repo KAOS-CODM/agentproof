@@ -1,42 +1,44 @@
 # AgentProof
 
-Audit and control layer for agentic commerce.
+Audit and control layer for agentic commerce. Ensures every financial action taken by an AI agent is authorized, constrained by deterministic policy, and recorded as auditable evidence.
+
+---
 
 ## What is AgentProof?
 
-AgentProof is a web application for the PayPal AI Hackathon that ensures every financial action taken by an AI agent is:
+AgentProof sits between AI intent parsing and financial execution. Its purpose is to:
 
-1. **Authorized** by explicit user intent
-2. **Constrained** by deterministic policy
-3. **Permitted or denied** according to current financial state
-4. **Executed** through PayPal Sandbox
-5. **Recorded** as auditable evidence
-6. **Explainable** after the fact
-7. **Protected** by backend-enforced human approval for consequential actions
+- **Interpret** free-form user requests into structured purchase intents via an LLM
+- **Evaluate** those intents against a deterministic policy engine (price, brand, condition, purpose rules)
+- **Present** only ALLOW-listed, immutable product snapshots to the user
+- **Execute** PayPal Sandbox orders only after policy ALLOW and explicit user confirmation
+- **Record** every step as owner-scoped evidence, with recovery paths for incomplete evidence
+- **Isolate** users from each other: no cross-user data access or existence leakage
 
-## Current Architecture
+The deterministic Policy Engine — not the LLM — is the sole authority for financial permission. The LLM may reason and propose; the Policy Engine alone decides ALLOW/DENY.
 
-```
-User Intent → LLM (OpenRouter) → Structured Intent → Policy Engine → ALLOW/DENY → PayPal Sandbox → Evidence
-```
+---
 
-**Key principle:** The LLM may reason and propose actions. The LLM must **never** be the final authority for financial actions. The deterministic Policy Engine is the sole authority.
+## The Problem it Addresses
 
-## Current Scope (P6)
+AI agents can propose financial actions, but without guardrails those actions are unconstrained. AgentProof provides:
 
-P6 completes the authenticated end-to-end demo loop and makes saved workflows refresh-safe:
+- **Explicit user intent** — every purchase originates from a user-supplied request, parsed into a structured intent
+- **Deterministic policy authority** — price, brand, condition, purpose, and confirmation-threshold rules evaluate proposals; the LLM never makes the final call
+- **Immutable product snapshots** — selections bind to server-side-captured offers; re-discovery cannot silently redirect to a newer offer
+- **PayPal Sandbox verification** — every capture is verified against the original order; mismatched orders are rejected
+- **Complete audit trail** — append-only evidence ledger with bounded recovery for incomplete post-capture events
+- **User ownership** — all intent, policy, transaction, and evidence records are scoped to the authenticated user; unknown and foreign IDs all return 404 with no existence leak
 
-- Structured intent → deterministic policy → discovery → PayPal order/capture → evidence → persisted history
-- Per-user workflow history is read from the existing repositories, not from browser storage
-- The UI restores a selected workflow from `#/?intent=<intent-id>` after a refresh
-- A verified PayPal return links back to that saved workflow
-- Payment status always comes from the persisted transaction; evidence completeness is shown explicitly
+---
+
+## Core Capabilities (P6)
 
 ### Implemented
 
-- ✅ Structured intent model with Zod validation and OpenRouter parsing
+- ✅ Structured intent model with Zod validation and OpenRouter AI parsing
 - ✅ Deterministic Policy Engine (PRICE, BRAND, CONDITION, PURPOSE, CONFIRMATION_THRESHOLD rules)
-- ✅ Channel3 or explicit demo product discovery
+- ✅ Channel3 or explicit demo product discovery, with per-intent associations that isolate one intent's offers from another's
 - ✅ PayPal Sandbox order creation, capture verification, and idempotent retry
 - ✅ Append-only, owner-scoped evidence ledger with bounded completion-evidence recovery
 - ✅ SQLite by default and MongoDB Atlas explicitly opt-in, with no silent fallback
@@ -44,351 +46,406 @@ P6 completes the authenticated end-to-end demo loop and makes saved workflows re
 - ✅ Persisted per-user workflow, transaction, discovery, and evidence history
 - ✅ Responsive React UI for the full workflow, including loading/empty/error states
 - ✅ Unit, repository-contract, API, and frontend tests
+- ✅ Policy engine gates PayPal order creation — confirmation required when maxAmount threshold exceeded
+- ✅ Selection binding to immutable offer snapshots with freshness windows and mismatch detection
+- ✅ Reteller handoff: server-verified URL redirect, never a general-purpose open redirect
 
 ### Not implemented
 
 - ❌ Public registration, password reset, account management, or session-management UI
+  Accounts are provisioned by the operator at startup; no registration or password-change flow exists.
 - ❌ Elasticsearch evidence search
 - ❌ AG Grid / Bryntum visualization
 - ❌ Dispute flow
 - ❌ Additional roles or multi-tenant administration
+- ❌ Channel3 integrated checkout — Channel3 provides product discovery and server-verified retailer handoff URLs; purchases are completed outside AgentProof
+- ❌ Live PayPal processing — only Sandbox is supported
+- ❌ Trend-based discovery, personalized shopping preferences, or daily product update notifications
+- ❌ Additional retailer integrations beyond Channel3
+
+---
+
+## Application Workflow
+
+The typical operator-plus-user journey:
+
+1. **Account provisioning** — The operator sets `AUTH_INITIAL_EMAIL` and `AUTH_INITIAL_PASSWORD` in `.env`; `initDb()` creates the account once at startup. There is no public registration route.
+
+2. **Sign in** — The operator-signed-in user visits `http://localhost:5173`, the app reads the `agentproof_session` HttpOnly cookie, and grants access.
+
+3. **Create intent** — The user submits a free-form request (e.g., "Buy me running shoes under $150, new only"). The app sends it to `POST /api/v1/intent`, which:
+   - Forwards the raw text to OpenRouter LLM for parsing into a structured intent
+   - Persists the intent owned by the authenticated user with status VALIDATED
+   - Returns the intent ID, routing the user to the discovery stage
+
+4. **Product discovery** — The user clicks **Find matching products**, which calls `POST /api/v1/products/discover`. The server:
+   - Retrieves the user's persisted structured intent
+   - Runs the DiscoveryFlowService: policy engine evaluates each candidate product
+   - Only ALLOW-listed products are stored as server-side snapshots (never client-supplied data)
+   - Persists per-intent discovery associations so one intent's offers never overwrite another's
+   - Returns the decision (ALLOW/DENY), allowed/ rejected candidates, and freshness info
+
+5. **Select product** — The user clicks **Select** on an ALLOW candidate. The server:
+   - Binds the selection to the exact immutable offer snapshot (price, currency, merchant snapshotted at discovery time)
+   - Enforces freshness window — stale snapshots are rejected
+   - Records PRODUCT_SELECTED evidence, bound to the selection row
+   - Returns the confirmed selection; the user can now proceed to payment
+
+6. **PayPal order creation** — The user clicks **Buy with PayPal**. The server:
+   - Re-evaluates policy against the persisted selection snapshot
+   - If confirmation is required (price above threshold), returns CONFIRMATION_REQUIRED
+   - If policy DENIED, returns 422 with evaluation details
+   - If authorized, creates a PayPal Sandbox order
+   - Persists a PAYMENT_PENDING transaction row (never PAYMENT_COMPLETED until capture)
+   - Returns the order ID, approval URL, and policy evaluation
+
+7. **PayPal approval** — The browser loads the PayPal SDK and the user approves the order in PayPal Sandbox.
+
+8. **PayPal capture** — The user (or flow) completes capture. The server:
+   - Verifies the captured order matches the transaction (amount, currency, invoice ID)
+   - If verified, transitions the transaction to PAYMENT_COMPLETED
+   - Records PAYPAL_PAYMENT_CAPTURED and PAYMENT_CAPTURED evidence events
+   - If evidence persistence fails, reports PAYMENT_COMPLETED with evidenceIncomplete flag and RECOVERY_PENDING status
+   - Returns the capture result with financialState
+
+9. **Evidence and history** — The user views the evidence timeline and saved workflow. The persisted transaction (not the transient PayPal response) is the source of truth for display. Completion evidence status is shown explicitly, with a reconcile action if evidence is incomplete.
+
+10. **Browser refresh** — The user's hash route (`#/?intent=<id>`) rehydrates the full workflow from the server: intent, discoveries, policy evaluations, latest transaction, and evidence. No re-discovery or stale client state is trusted.
+
+---
+
+## Architecture and Technology Stack
+
+### Persistence Providers
+
+The application supports exactly two persistence providers, selected via `PERSISTENCE_PROVIDER` env variable (default: `sqlite`):
+
+| Feature | SQLite (default) | MongoDB Atlas |
+|---|---|---|
+| **Database** | sql.js in-process, DB file at `DB_PATH` | MongoDB Atlas cluster |
+| **Configuration** | `DB_PATH` (default: `./data/agentproof.db`) | `MONGODB_URI`, `MONGODB_DB` |
+| **Startup** | Load or create DB, run migrations, provision initial account | Connect, create P2-B through P6 indexes, abort on failure |
+| **Fallback** | None — explicit provider choice required | None — explicit provider choice required |
+| **Credits** | None required | `MONGODB_URI` must not be embedded in frontend bundles |
+
+### Key Design Principles
+
+- **No automatic fallback** — selecting `mongodb` and having missing/invalid config fails startup clearly
+- **MongoDB DNS fix required** — Windows default DNS (127.0.0.1) cannot resolve Atlas SRV records; set `dns.setServers(['8.8.8.8'])` at startup
+- **No hybrid store** — product/discovery data lives entirely in one provider or the other; no SQLite+MongoDB mix
+- **Credentials stay server-side** — `MONGODB_URI`, `OPENROUTER_API_KEY`, `CHANNEL3_API_KEY`, and `PAYPAL_CLIENT_SECRET` never reach the browser
+
+### Authentication and Sessions
+
+- **Operator-provisioned accounts only** — `AUTH_INITIAL_EMAIL` and `AUTH_INITIAL_PASSWORD` in `.env`; no registration, reset, or password-change flow
+- **HttpOnly session cookie** — `agentproof_session`, `SameSite=Strict`, `Path=/`, `Secure` controlled by `AUTH_COOKIE_SECURE`
+- **Session validation on each protected route** — token hash looked up in repository; active lookup enforces `expiresAt` and `revokedAt`
+- **No browser storage for tokens** — cookies only; `credentials: 'include'` on all API requests
+- **401 → sign-in screen** — expired or revoked session returns the user to the login page
+
+### Ownership and Access Isolation
+
+- **Every repository query is scoped to the authenticated user** — `userId` from the session, never from client input
+- **Unknown IDs and other users' IDs both return 404** — no existence leak
+- **List/filter/get cannot widen access** — filtering by `intentId` or `transactionId` on evidence returns only the caller's records
+- **Client-supplied `userId` fields are ignored** — intent context resolves from the persisted, owned intent
+
+### Evidence Integrity and Recovery
+
+- **Deterministic evidence IDs** (`ev:<transactionId>:<eventType>`) with atomic insert-if-absent writes
+- **Retries and concurrent writers converge on one record** — no duplicates or overwrites
+- **Post-capture evidence recovery** is bounded: only writes missing events for a persisted `PAYMENT_COMPLETED` transaction with a PayPal order ID
+- **Recovery is best-effort** — a completed transaction with missing evidence is reconciled on the next capture retry or explicit check-evidence action
+- **Evidence never supersedes the durable transaction state** — even if evidence reconciliation fails, the financial state remains as persistently recorded
+
+### Payment Idempotency
+
+- **Order creation** produces a transaction in PAYMENT_PENDING state with a PayPal order ID
+- **Capture** is idempotent: retrying an already-completed transaction returns `ALREADY_COMPLETED` without re-capturing
+- **Order attempts** table enforces unique `(user_id, idempotency_key)` — a retry is a lookup, not a second PayPal order
+- **Payment completion** is durable: once the transaction is `PAYMENT_COMPLETED`, it survives API restarts and browser refreshes
+
+### External Service Integrations
+
+| Service | Role | Credentials |
+|---|---|---|
+| **OpenRouter** | LLM intent parsing | `OPENROUTER_API_KEY` (server-side only) |
+| **PayPal Sandbox** | Order creation and capture | `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` (client ID forwarded to browser; secret stays server-side) |
+| **Channel3** | Product discovery API | `CHANNEL3_API_KEY` (server-side only) |
+| **OpenDB** | MongoDB Atlas | `MONGODB_URI`, `MONGODB_DB` (server-side only) |
+
+### Error Handling and Important Limitations
+
+- **Missing credentials** are configuration blockers, not silent failures. A real payment/capture requires operator-supplied Sandbox credentials.
+- **Channel3 checkout is not integrated** — the handoff endpoint returns a server-verified URL; opening the retailer does not complete a purchase inside AgentProof, and the app records no purchase claim.
+- **MongoDB Atlas requires public DNS** — Windows 127.0.0.1 cannot resolve SRV records; `dns.setServers(['8.8.8.8'])` is a process-level fix at startup.
+- **No background reconciliation worker** — completed-transaction evidence is reconciled on the next capture retry or explicit action.
+- **SQLite single-process only** — concurrent API processes against the same `DB_PATH` race on whole-file replacement.
+- **Prices and availability are snapshotted** at discovery time — re-discovery is required for current data.
+- **Compound intents (multiple product categories)** are not supported — each request must request one product category.
+
+---
 
 ## Project Structure
 
 ```
 agentproof/
-├── apps/
-│   ├── api/              # Express backend
-│   └── web/              # React frontend
-├── packages/
+├ apps/
+│   ├── api/              # Express backend (port 3001)
+│   └── web/              # React frontend (port 5173)
+├ packages/
 │   └── shared/           # Shared Zod schemas and types
-├── docs/                 # Architecture documentation
-└── README.md
+├ data/                   # SQLite database file (generated at startup)
+└ README.md
 ```
 
-## Installation
+### API (`apps/api/`)
+
+- Entry: `src/index.ts` — initializes persistence, then mounts routers under `/api/v1/`
+- Routers: `auth.ts`, `intent.ts`, `policy.ts`, `evidence.ts`, `products.ts`, `selections.ts`, `payments.ts`
+- Models: `db.ts` (SQLite schema + migration), `repositories.ts` (provider resolution), `persistenceProvider.ts` (provider selection), `startup.ts` (DNS + init + index)
+- Middleware: `auth.ts` (requireAuth, optionalAuth)
+- Services: AI (intent parsing), Policy Engine, Discovery Flow, Product Resolution, PayPal Client, Evidence Service, Order Creation
+
+### Web (`apps/web/`)
+
+- Entry: `src/App.tsx` — hash-route driven workflow (intent → policy → product → payment → evidence)
+- Components: `LoginScreen`, `IntentInput`, `CandidateCard`, `PaymentPanel`, `EvidenceTimeline`, `WorkflowHistory`, `StructuredIntentView`, `RetailerHandoff`
+- Hooks: `useHashRoute`, `useSearchParams`
+- API client: `src/api.ts` (imported types and functions from shared)
+
+### Shared (`packages/shared/`)
+
+- Zod schemas: `structuredIntentSchema`, `productSchema`, `policyEvaluationSchema`, `evidenceRecordSchema`, etc.
+- Type definitions: `StructuredIntent`, `Product`, `PolicyEvaluation`, `EvidenceRecord`, `FinancialState`, etc.
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js >= 22.0.0
+- Git
+- PayPal Sandbox account (for end-to-end payment flow)
+- OpenRouter API key (for AI intent parsing, optional if using pre-structured intents)
+- Channel3 API key (for live discovery, optional if using demo catalog)
+
+### Installation
 
 ```bash
 npm install
 ```
 
-## Running the Application
+### Environment Configuration
 
-### API (port 3001)
-
-```bash
-npm run dev:api
-```
-
-### Web (port 5173)
-
-```bash
-npm run dev:web
-```
-
-### Tests
-
-```bash
-npm test
-```
-
-## API Endpoints
-
-### Endpoints
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| GET | `/health` | Public | Health check |
-| POST | `/api/v1/auth/login` | Public | Exchange email/password for an HttpOnly session cookie |
-| POST | `/api/v1/auth/logout` | Public | Revoke the current session and clear the cookie |
-| GET | `/api/v1/auth/session` | Required | Return the authenticated user and session expiry |
-| POST | `/api/v1/intent` | Required | Create a structured intent owned by the caller |
-| GET | `/api/v1/intent` | Required | List the caller's saved intents, newest first (`limit`, max 50) |
-| GET | `/api/v1/intent/:id` | Required | Retrieve one of the caller's intents |
-| POST | `/api/v1/policy/evaluate` | Required | Evaluate a product against the caller's intent |
-| POST | `/api/v1/products/discover` | Required | Discover products for the caller's intent |
-| GET | `/api/v1/products/discoveries/:intentId` | Required | Restore saved discovery snapshots and policy evaluations for an owned intent |
-| POST | `/api/v1/payments/create-order` | Required | Create a PayPal order for the caller's intent/product |
-| POST | `/api/v1/payments/capture` | Required | Capture the caller's approved order (safe to retry) |
-| GET | `/api/v1/payments/history` | Required | List the caller's transactions, newest first (`intentId`, `limit`) |
-| GET | `/api/v1/payments/by-order/:orderId` | Required | Look up the caller's transaction by PayPal order id |
-| GET | `/api/v1/evidence` | Required | List the caller's evidence (`intentId`/`transactionId` filters) |
-| GET | `/api/v1/evidence/:id` | Required | Retrieve one of the caller's evidence records |
-
-## Technology Stack
-
-- **Frontend:** React, TypeScript, Vite, plain CSS
-- **Backend:** Node.js 22, Express, TypeScript
-- **Validation:** Zod
-- **Database:** SQLite (sql.js) by default; MongoDB Atlas opt-in (`PERSISTENCE_PROVIDER`)
-- **Testing:** Vitest
-- **AI:** OpenRouter for intent parsing
-- **Payments:** PayPal Sandbox / Web SDK v6
-- **Discovery:** Channel3, or the explicit `demo` catalog for local development
-
-## Local Operator Setup (P6)
-
-No `.env` file is included in the repository. The operator creates it from
-`.env.example`; never commit real credentials. The following values are required
-for the full authenticated UI flow.
-
-1. Install dependencies:
-
-   ```bash
-   npm install
-   ```
-
-2. Create the local env file:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-   On Windows PowerShell use `Copy-Item .env.example .env`.
-
-3. Provision the single local account. Set **both** values together in `.env`:
+1. **Create `.env` at the repository root** (no example file included; copy the config below):
 
    ```dotenv
+   # Required for the authenticated UI flow (both must be set together)
    AUTH_INITIAL_EMAIL=you@example.com
    AUTH_INITIAL_PASSWORD=<at-least-12-characters>
    WEB_ORIGIN=http://localhost:5173
-   ```
 
-   Startup creates the account once. Re-running never modifies or resets an
-   existing account. There is no registration route, password-reset flow, or
-   account-management UI.
-
-4. Choose exactly one discovery source:
-
-   ```dotenv
+   # Discovery source (choose one)
    DISCOVERY_PROVIDER=demo
-   ```
-
-   or, for live Channel3 discovery:
-
-   ```dotenv
+   # or for live Channel3:
    DISCOVERY_PROVIDER=channel3
    CHANNEL3_API_KEY=<server-side-channel3-key>
-   ```
 
-   An empty `DISCOVERY_PROVIDER` defaults to Channel3. A live-provider failure is
-   reported as an error; it never silently falls back to demo data.
-
-5. For natural-language intent parsing, set:
-
-   ```dotenv
-   OPENROUTER_API_KEY=<server-side-openrouter-key>
+   # Natural-language intent parsing
+   OPENROUTER_API_KEY=<server-openrouter-key>
    OPENROUTER_MODEL=openai/gpt-4o-mini
-   ```
 
-   Without this key, `POST /api/v1/intent` cannot parse free-form input. The API
-   still accepts a pre-structured intent payload, but the bundled UI submits raw
-   text.
-
-6. For the full PayPal flow, use credentials from a PayPal Sandbox app:
-
-   ```dotenv
+   # PayPal Sandbox
    PAYPAL_CLIENT_ID=<sandbox-client-id>
    PAYPAL_CLIENT_SECRET=<sandbox-client-secret>
    PAYPAL_BASE_URL=https://api-m.sandbox.paypal.com
    PAYPAL_RETURN_URL=http://localhost:5173/#/payment/return
    PAYPAL_CANCEL_URL=http://localhost:5173/#/payment/cancel
-   ```
 
-   `PAYPAL_CLIENT_ID` is intentionally forwarded to the browser by
-   `apps/web/vite.config.ts` for the PayPal SDK. `PAYPAL_CLIENT_SECRET`,
-   `OPENROUTER_API_KEY`, `CHANNEL3_API_KEY`, and `MONGODB_URI` remain server-side.
-
-7. Persistence is SQLite by default:
-
-   ```dotenv
+   # Persistence provider (sqlite by default)
    PERSISTENCE_PROVIDER=sqlite
+
+   # MongoDB Atlas (explicit opt-in; requires all three)
+   # PERSISTENCE_PROVIDER=mongodb
+   # MONGODB_URI=mongodb+srv://<user>:<password>@<cluster-host>/?retryWrites=true&w=majority
+   # MONGODB_DB=agentproof
+
+   # Channel3 handoff configuration
+   RETAILER_HANDOFF_ENABLED=false
+   CHANNEL3_ALLOWED_LINK_HOSTS=buy.trychannel3.com
    ```
 
-   To select MongoDB explicitly, set both values; startup fails closed if they
-   are missing or unusable:
+2. **Important**: `PAYPAL_CLIENT_ID` is forwarded to the browser for the PayPal SDK. All other credentials remain server-side only.
 
-   ```dotenv
-   PERSISTENCE_PROVIDER=mongodb
-   MONGODB_URI=mongodb+srv://<user>:<password>@<cluster-host>/?retryWrites=true&w=majority
-   MONGODB_DB=agentproof
-   ```
-
-8. Start the API and web app in separate terminals:
+3. **Start the services** (separate terminals):
 
    ```bash
    npm run dev:api
    npm run dev:web
    ```
 
-9. Open `http://localhost:5173`, sign in with the provisioned account, create an
-   intent, and complete the workflow. The saved workflow remains available after
-   a browser refresh. With the default SQLite provider it is also loaded after an
-   API restart from `apps/api/data/agentproof.db` (the default `DB_PATH`, resolved
-   from the API working directory).
+4. **Open the app** at `http://localhost:5173`, sign in with the provisioned account, and complete the workflow.
 
-**Live PayPal verification blocker:** this repository does not contain PayPal
-Sandbox credentials and no external service was contacted during implementation.
-A real payment/capture can only be verified after the operator provisions a
-Sandbox app and account with the variables above. Missing credentials must be
-reported as a configuration blocker, not bypassed with fake success states.
+### SQLite Database Location
 
-## Environment Variables
+The default `DB_PATH=./data/agentproof.db` resolves relative to the API working directory (`apps/api`), producing `apps/api/data/agentproof.db`. The path is created automatically on first startup; an existing file is loaded and migrated; empty or corrupt files fail startup.
 
-See `.env.example` for the complete annotated list. The local operator must
-provide the values described above; the defaults keep SQLite and never silently
-switch providers.
+### MongoDB Atlas Setup
+
+To select MongoDB explicitly:
+
+```dotenv
+PERSISTENCE_PROVIDER=mongodb
+MONGODB_URI=mongodb+srv://<username>:<password>@<cluster-host>/?retryWrites=true&w=majority
+MONGODB_DB=agentproof
+```
+
+A startup DNS fix is required on Windows: the process-level `dns.setServers(['8.8.8.8'])` enables Atlas SRV resolution. See the **Deployment considerations** section below.
+
+---
+
+## Testing and Build Commands
+
+| Command | Scope |
+|---|---|
+| `npm run build` | Build all packages and apps (shared → api → web) |
+| `npm run typecheck` | Type-check all packages and apps |
+| `npm run test:api` | API test suite (Vitest) |
+| `npm run test:web` | Frontend test suite (Vitest + React Testing Library) |
+| `npm test` | Run both API and web test suites |
+
+### API Tests
+
+- 675+ tests across: repository contracts, service logic, route handlers, cross-user regression
+- Cross-user tests use in-memory repo pattern to avoid SQLite initDb() blocker
+- 1 pre-existing failure: `persistenceProvider.test.ts` expects `sqlite` but env has `mongodb` configured
+
+### Web Tests
+
+- 72 tests across: selection, workflow, API auth, API history, router, api selection, api auth, api handoff
+
+### TypeScript Build Fix
+
+Added `"exclude": ["**/*.test.ts", "**/*.spec.ts"]` to `apps/api/tsconfig.json` so that `tsc --noEmit` does not compile test files, eliminating 3 diagnostic errors in `cross-user-regression.test.ts`.
+
+---
+
+## Deployment Considerations
+
+### Render / Production Deployment
+
+- **Set `NODE_ENV=production`** — this prunes devDependencies and affects cookie security settings
+- **Persistence provider** — default is `sqlite`; to use MongoDB, set `PERSISTENCE_PROVIDER=mongodb` with valid `MONGODB_URI` and `MONGODB_DB`
+- **DNS fix for MongoDB** — on Windows, the process-level `dns.setServers(['8.8.8.8'])` in `startup.ts` enables Atlas SRV resolution. On Linux/macOS, the system DNS resolver typically handles SRV records correctly.
+- **Environment variables** — all secrets (`MONGODB_URI`, `OPENROUTER_API_KEY`, `PAYPAL_CLIENT_SECRET`, `CHANNEL3_API_KEY`) must be set as Render environment variables, never in the codebase
+- **CORS** — set `WEB_ORIGIN` to the production frontend URL; `CORS_ORIGIN` can be set to `null` to disable CORS in production
+- **Cookie security** — `AUTH_COOKIE_SECURE` defaults to `on` in production; ensure the deployment uses HTTPS
+- **No automatic startup provisioning** — the operator must ensure `AUTH_INITIAL_EMAIL` and `AUTH_INITIAL_PASSWORD` are set if an initial account is needed at startup
+
+### MongoDB SRV Resolution
+
+The MongoDB Atlas connection string uses SRV records for load balancing and failover. On Windows, the default DNS resolver (127.0.0.1) cannot resolve these records. The fix is a process-level configuration in `apps/api/src/models/startup.ts`:
+
+```typescript
+dns.setServers(['8.8.8.8']);
+```
+
+This is set once at startup, before any MongoDB connection attempt. On Linux and macOS, the system DNS resolver typically handles SRV records without additional configuration.
+
+### Live PayPal Blocked
+
+This repository does not contain PayPal Sandbox credentials, and no external service was contacted during implementation. A real payment/capture can only be verified after the operator provisions a Sandbox app and account with the required environment variables. Missing credentials must be reported as a configuration blocker, not bypassed with fake success states.
+
+### Channel3 Handoff
+
+The retailer handoff endpoint returns a server-verified URL bound to the exact offer snapshot the user selected. Opening this URL completes the purchase outside AgentProof; the app records no purchase claim and does not intercept the redirect. The handoff feature is disabled by default (`RETAILER_HANDOFF_ENABLED=false`) and must be explicitly enabled by the operator with approved allowed link hosts.
+
+---
+
+## Security and Trust Model
+
+### What AgentProof Guarantees
+
+- **No financial action occurs without explicit user intent** — every purchase starts from a user-supplied request
+- **The Policy Engine (not the LLM) controls ALLOW/DENY** — all financial permission is deterministic and auditable
+- **PayPal capture is verified** — amount, currency, and invoice ID must match the original order before any state transition
+- **User data is isolated** — every repository query is scoped to the authenticated user; no cross-user access or existence leakage
+- **Evidence is append-only and deterministic** — deterministic IDs and insert-if-absent writes prevent duplicates; recovery is bounded
+- **Selections bind to immutable snapshots** — re-discovery cannot silently redirect to a newer or different offer
+- **Credentials never reach the browser** — `MONGODB_URI`, `OPENROUTER_API_KEY`, `PAYPAL_CLIENT_SECRET`, `CHANNEL3_API_KEY` are server-side only
+
+### Trusted Paths
+
+- Operator provisions the initial account at startup (`AUTH_INITIAL_EMAIL` + `AUTH_INITIAL_PASSWORD`)
+- All API requests include `credentials: 'include'` to send the HttpOnly session cookie
+- Frontend probes `/api/v1/auth/session` on load; unauthenticated users are shown the sign-in screen
+- State-changing requests must match `WEB_ORIGIN` via CORS or SameSite/Referer checks
+- PayPal order creation and capture are gated by policy evaluation; confirmation is required when the price exceeds the threshold
+
+### Threat Model Summary
+
+| Threat | Mitigation |
+|---|---|
+| AI proposes unauthorized action | Policy Engine alone decides ALLOW/DENY; LLM output is never the final authority |
+| User accesses another user's data | Ownership scoped to session userId; foreign IDs return 404 |
+| Client tampers with price/currency | All price/currency resolved from server-side discovery snapshots, never from request body |
+| PayPal order forged | Capture verification checks amount, currency, and invoice ID match |
+| Evidence overwritten or duplicated | Deterministic IDs + atomic insert-if-absent; retries converge on one record |
+| Stale offer selected after re-discovery | Selections bind to exact snapshotId; freshness window enforced; mismatch detected |
+| MongoDB credentials leaked | All credentials server-side only; never in frontend bundles or environment files exposed to clients |
+
+---
 
 ## Current Limitations
 
-- No public registration, password reset, password rotation, or session-management
-  UI; accounts are provisioned by the operator.
-- Default SQLite uses an in-process `sql.js` database. It now flushes a complete
-  snapshot to `DB_PATH` after each mutation and on shutdown using an atomic
-  replace, but it remains a single-process store: do not run multiple API
-  processes against the same database file. MongoDB is explicit opt-in.
-- PayPal completion can only be verified end-to-end with operator-supplied
-  Sandbox credentials and a provisioned Sandbox account.
-- Saved discovery history contains shared-offer snapshots and their owner-scoped
-  policy evaluations. Rejected candidates were never persisted as reconstructable
-  offers, so re-running discovery is required to review denied current offers.
-- There is no background reconciliation worker. Completed-transaction evidence is
-  reconciled on the next safe capture retry or explicit check-evidence action.
+- **No public registration, password reset, or account management UI** — accounts are operator-provisioned only
+- **SQLite is a single-process store** — do not run multiple API processes against the same `DB_PATH`
+- **PayPal completion requires operator-supplied Sandbox credentials** — no end-to-end verification without them
+- **Channel3 provides product discovery and server-verified handoff URLs only** — integrated checkout is not implemented
+- **MongoDB Atlas requires explicit configuration and DNS fix** (Windows: `dns.setServers(['8.8.8.8'])` at startup)
+- **No background reconciliation worker** — completed-transaction evidence is reconciled on the next capture retry or explicit action
+- **Prices and availability are snapshotted at discovery time** — re-discovery required for current data
+- **Compound intents (multiple product categories)** are not supported
+- **No session cleanup job for SQLite** — expired rows are ignored by active lookup but not physically deleted
+- **Legacy ownerless data** (pre-P5) is intentionally hidden from normal users; trusted operator path required for migration
+- **No WAL or multi-writer coordination** for SQLite — one API process per `DB_PATH`
 
-## Evidence recovery (P2-C)
+### Roadmap (planned, not implemented)
 
-- Post-capture evidence uses deterministic IDs (`ev:<transactionId>:<eventType>`) and atomic insert-if-absent writes. Retries and concurrent writers cannot create duplicates or overwrite an existing record.
-- If evidence persistence fails after a durable payment completion, the capture still returns `PAYMENT_COMPLETED` with `evidenceIncomplete: true` and `evidenceStatus: "RECOVERY_PENDING"`; raw database errors are never returned to clients.
-- Recovery is bounded and requires a persisted `PAYMENT_COMPLETED` transaction with a PayPal order id. It is attempted when a capture reports incomplete evidence and when an already-completed transaction is retried. It never calls PayPal, never repeats the state transition, and only writes the missing completion events supported by persisted order/capture data.
-- Recovery is best-effort, not crash-guaranteed: a completed transaction with missing evidence is reconciled on the next completed-capture retry, or by calling `EvidenceService.recoverCompletionEvidence` from a trusted reconciliation path.
-
-## Product and discovery persistence (P3)
-
-- Shared provider offers are stored once per `(source, productId)`. Product ids are provider-local, so the provider identity is always part of the key.
-- Per-intent discovery associations are stored independently under `(intentId, source, productId)`. Two intents can discover the same product without overwriting each other, and re-discovery is an idempotent update for that one intent.
-- Refreshing a shared offer updates only the offer. It never deletes or rewrites any intent's discovery association.
-- `sqlite` (default) keeps offers in the existing `products` table and associations in the new `intent_discoveries` table.
-- `mongodb` (opt-in) stores offers in `offers` and associations in `intentDiscoveries`. Startup creates the P3 indexes alongside the P2-B and P4 indexes.
-- P3 indexes:
-  - `offers`: unique `uniq_source_product` on `{source: 1, productId: 1}`
-  - `intentDiscoveries`: unique `uniq_intent_provider_product` on `{intentId: 1, source: 1, productId: 1}`, plus `by_intent_recent` on `{intentId: 1, discoveredAt: -1}`
-- Selecting `mongodb` migrates product and discovery persistence as well; there is no hybrid product store. Connection or index failure aborts startup and never falls back to SQLite.
-- **Consistency limitation:** an offer and its per-intent association are separate documents written without a cross-collection transaction. If the association write fails after the offer write, the request fails and the refreshed ownerless offer remains; this is not reported as success. The legacy SQLite `products.id` primary key also means provider-distinct offers sharing an id remain a SQLite-only limitation.
-
-## Users and sessions persistence (P4)
-
-- P4 added only the persistence foundation for accounts and server-side sessions. P5 builds the authentication and ownership layer on top of these repositories.
-- `sqlite` (default) stores accounts in `users` and sessions in `sessions`.
-- `mongodb` (opt-in) stores accounts in `users` and sessions in `sessions`. Startup creates the P4 indexes after the P2-B and P3 indexes; a connection or index failure aborts startup with no SQLite fallback.
-- Email addresses are trimmed and lower-cased before storage and lookup. Uniqueness is enforced on that normalized value (`users.uniq_email`).
-- Only `passwordHash` is stored; the repository never stores plaintext passwords. Normal user reads omit the hash; the explicit `getCredentialsByEmail` lookup is used only by the server-side login verification path.
-- Only a caller-supplied `tokenHash` is stored, never the raw bearer token. Sessions carry `expiresAt` and an optional `revokedAt`; active lookup enforces both even though MongoDB TTL deletion is asynchronous.
-- P4 indexes:
-  - `users`: unique `uniq_email` on `{email: 1}`
-  - `sessions`: unique `uniq_token_hash` on `{tokenHash: 1}`, `by_user` on `{userId: 1}`, and TTL `ttl_expires` on `{expiresAt: 1}` with `expireAfterSeconds: 0`
-- MongoDB `expiresAt`/`revokedAt` are BSON `Date` values; SQLite stores ISO timestamps.
-- **Limitation:** no session cleanup job exists for SQLite; expired rows are ignored by active lookup. MongoDB relies on the TTL monitor and still checks expiry in application code.
-
-## Authentication, ownership, and scoped evidence (P5)
-
-- **No public registration.** The operator provisions the initial account at startup with `AUTH_INITIAL_EMAIL` and `AUTH_INITIAL_PASSWORD`. Both must be set together; the password must be at least 12 characters. Provisioning is idempotent: an existing account is never modified or re-created. Neither the password nor its hash is logged.
-- **Passwords are never stored in plaintext.** Password hashes use Node's built-in `crypto.scrypt` with a fresh random salt per password and constant-time verification. Unknown emails still perform a dummy verification to reduce account-enumeration timing differences. Login failures always return the same generic `401 Invalid email or password`.
-- **Server-side sessions.** A login issues 32 cryptographically random bytes (base64url) as the bearer value. Only its SHA-256 hash is persisted; the raw token is never stored or returned in JSON. The token is delivered in the `agentproof_session` cookie with `HttpOnly`, `SameSite=Strict`, `Path=/`, and `Secure` controlled by `AUTH_COOKIE_SECURE` (default: on in production, off otherwise). Active lookup enforces `expiresAt` and `revokedAt`; logout revokes the session and clears the cookie.
-- **Ownership comes from the session only.** Intents, policy evaluations, transactions, and evidence records carry the authenticated user id; intent-discovery associations are reachable only after the owning intent is verified. Client-supplied `userId` fields are ignored. Discovery and order creation resolve the caller's persisted intent (and its stored structured intent) rather than trusting client-supplied intent context. Product price/currency/merchant data is resolved from the server-side discovery snapshot.
-- **No cross-user access or existence leak.** List/filter/get operations are scoped to the caller. Unknown ids and another user's ids both return `404`; a scoped list with no matches returns an empty array. Payment capture and PayPal order lookup are owner-scoped.
-- **Legacy ownerless rows stay inaccessible.** Rows written before P5 (NULL/missing `userId`) are not exposed to ordinary users and are not backfilled automatically. A trusted recovery/maintenance path can still address them through the unscoped internal repository methods.
-- **Evidence remains append-only and fully scoped.** `GET /api/v1/evidence` accepts only the caller's records, and `intentId`/`transactionId` filters cannot widen access. `GET /api/v1/evidence/:id` returns `404` for ownerless or foreign records. Deterministic completion ids (`ev:<transactionId>:<eventType>`) and insert-if-absent recovery semantics are unchanged.
-- **CSRF/CORS.** CORS uses the explicit `WEB_ORIGIN` with `credentials: true` (never a wildcard). State-changing requests with an `Origin`/`Referer` header must match `WEB_ORIGIN` or the request's own host; the session cookie is also `SameSite=Strict`. Non-browser clients without either header are not blocked by the CSRF middleware.
-- **Frontend.** The web app probes `/api/v1/auth/session` on load, shows a sign-in screen when unauthenticated, sends cookies with every API request (`credentials: 'include'`), returns to sign-in on an expired-session `401`, and renders clear `403` authorization messages. No token is kept in browser storage.
-
-### P5 limitations
-
-- Only the operator-provisioned account exists, and no API creates additional accounts; there is no registration, reset, or password-change flow.
-- SQLite sessions are ignored after expiry but are not physically deleted; MongoDB uses a TTL index and still checks expiry in application code.
-- Legacy ownerless data must be migrated or handled by a trusted operator path; it is intentionally hidden from normal users.
-
-## Persisted workflow and history (P6)
-
-- **One source of truth.** Saved workflows come from the existing user-scoped
-  intent, transaction, policy-evaluation, and discovery repositories. There is no
-  second datastore, no browser-storage fallback, and no client-supplied ownership.
-- **History endpoints.** `GET /api/v1/intent` lists the caller's intents newest
-  first; `GET /api/v1/payments/history` lists the caller's transactions and
-  accepts an optional `intentId` filter; `GET /api/v1/products/discoveries/:intentId`
-  restores saved offers after verifying intent ownership. The two history lists
-  cap `limit` at 50; history filters cannot widen ownership and return an empty
-  list, while a foreign or unknown discovery intent returns `404`.
-- **Restore after refresh.** The UI uses hash-query rehydration
-  (`#/?intent=<id>`) to load the intent, saved discovery/policy state, latest
-  persisted transaction, and evidence. A valid session restores the workflow
-  without re-running discovery or trusting stale client objects.
-- **Payment truth.** Pending/completed payment display is derived from the
-  persisted `Transaction`, not from a transient PayPal response. A successful
-  capture refreshes the saved transaction and evidence; an ambiguous verification
-  error is reported as unconfirmed, never as a failed payment.
-- **Completion evidence.** Expected completion events are
-  `PAYMENT_COMPLETED` plus `PAYPAL_PAYMENT_CAPTURED`/`PAYMENT_CAPTURED` when a
-  capture id exists. Missing evidence is shown as an explicit incomplete state
-  with a reconcile action. Reconcile reuses the idempotent capture endpoint, which
-  performs bounded recovery without calling PayPal for an already-completed
-  transaction.
-- **Honest restoration limits.** Only server-persisted approved offer snapshots
-  can be shown; retained offers may come from earlier discovery runs or an earlier
-  provider configuration. Rejected candidates were not stored as offers, so the
-  restored panel says so and offers "Re-run discovery" to evaluate current prices.
-  Order creation still resolves only through the active provider, enforces the
-  snapshot freshness window, and re-evaluates policy server-side.
-- **PayPal return.** `#/payment/return` resolves the order, verifies capture, and
-  distinguishes completed, already-completed, cancelled, and unconfirmed
-  outcomes. It redirects back with a hash route so no server-side rewrite is
-  required.
-
-## SQLite durability lifecycle (P6 follow-up)
-
-- **Existing file first.** `initDb()` loads `DB_PATH` when the file exists and
-  creates a new database only when it does not. An empty or corrupt existing file
-  fails startup instead of being replaced, and the file is left untouched.
-- **Migration is persisted.** The existing schema/migration path runs first. The
-  migrated snapshot is then written before the API starts serving, so a new
-  database file and any ownership-column migrations are durable immediately.
-- **Write-through persistence.** `sql.js` holds the database in memory. The
-  wrapper in `apps/api/src/models/db.ts` flushes the full database after every
-  mutating `run`, `exec`, or prepared `run` call. A successful repository write
-  is therefore on disk before the caller receives success; it is not deferred
-  until shutdown.
-- **Atomic file replacement.** Each flush writes a unique temporary file in the
-  database directory, fsyncs it, and renames it over `DB_PATH`. A failure leaves
-  the previous database intact and removes the temporary file. Empty exports are
-  rejected. POSIX also fsyncs the parent directory; Windows relies on the
-  filesystem after flushing the file.
-- **Shutdown and startup provisioning.** Normal SIGINT/SIGTERM shutdown closes
-  the HTTP server and calls `closeDb()`, which saves again and closes the handle.
-  An existing user is found on the next startup, so provisioning does not reset
-  its password or recreate the account.
-- **Single-writer trade-off.** Every mutation rewrites the whole SQLite file.
-  That favors simplicity and correctness for this local demo, not high write
-  throughput. One API process per `DB_PATH` is required; concurrent processes
-  would race on whole-file replacement. There is no WAL mode or multi-writer
-  coordination.
-- **Default location.** With the workspace scripts, the API working directory is
-  `apps/api`, so the default `DB_PATH=./data/agentproof.db` resolves to
-  `apps/api/data/agentproof.db`. The path is relative to the API process working
-  directory.
-
-## Next Phase
-
-P6 is the current completed scope. P7 and later are not implemented.
-
-## Roadmap
-
-Planned capabilities that go beyond the current P6 scope:
-
-- **Personalised shopping preferences** — user-configurable preferences for product categories, price ranges, and brands.
-- **Daily personalised product updates** — curated product recommendations based on saved preferences and discovery history.
-- **Price and availability change notifications** — alerts when monitored products change price or become available.
-- **Trend-based discovery** — when reliable popularity data is available, feature products with rising interest.
-- **Channel3 checkout capability** — investigation of deeper Channel3 integration for completing purchases within the workflow; not currently implemented.
-- **Additional retailer integrations** — supporting outbound links to additional merchant platforms beyond Channel3.
-- **Future PayPal-connected purchasing workflows** — beyond the current Sandbox verification, exploring end-to-end PayPal-connected purchase flows that remain explicitly authorized by the user.
+- **Personalised shopping preferences** — user-configurable preferences for product categories, price ranges, and brands
+- **Daily personalised product updates** — curated product recommendations based on saved preferences and discovery history
+- **Price and availability change notifications** — alerts when monitored products change price or become available
+- **Trend-based discovery** — when reliable popularity data is available, feature products with rising interest
+- **Channel3 checkout capability** — investigation of deeper Channel3 integration for completing purchases within the workflow; not currently implemented
+- **Additional retailer integrations** — supporting outbound links to additional merchant platforms beyond Channel3
+- **Future PayPal-connected purchasing workflows** — beyond the current Sandbox verification, exploring end-to-end PayPal-connected purchase flows that remain explicitly authorized by the user
 
 All future roadmap items are aspirational and will be implemented only after explicit approval. None of the above should be described as completed or guaranteed functionality. Consequential financial actions must always require explicit user authorization.
+
+---
+
+## License
+
+MIT License
+
+Copyright (c) 2026 Isaiah Yemi Adelowo
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

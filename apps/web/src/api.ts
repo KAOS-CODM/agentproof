@@ -134,6 +134,8 @@ export interface SelectionHistoryResponse {
 
 export interface CreateSelectionResponse {
   selection: SelectionView;
+  evidenceRecorded: boolean;
+  evidenceError?: string | null;
 }
 
 // ── Session-expiry notification ────────────────────────────────────────────
@@ -170,7 +172,10 @@ export class ApiError extends Error {
 // ── Helper ──────────────────────────────────────────────────────────────────
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
+  // Use VITE_API_URL as base when set (production); fall back to relative paths
+  // so the existing Vite proxy continues working for local development.
+  const base = import.meta.env.VITE_API_URL || '';
+  const res = await fetch(base + path, {
     // Session cookies are HttpOnly and must be sent with every API request.
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },

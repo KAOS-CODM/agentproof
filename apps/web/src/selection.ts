@@ -540,7 +540,7 @@ export function selectionEvidenceWarning(state: SelectionState): string | null {
     state.status !== 'saved' ||
     state.saved === null ||
     state.savedEvidence === null ||
-    state.savedEvidence.recorded !== false
+    state.savedEvidence?.recorded !== false
   ) {
     return null;
   }
